@@ -1,0 +1,5 @@
+class Add a where
+    (+) :: a -> a -> a
+
+instance Add Int where
+    (+) a b = __addInt a b
