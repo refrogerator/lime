@@ -2,16 +2,20 @@
 
 module Main where
 
-import System.Process
-import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
-import Text.Megaparsec hiding (State, Pos)
-import Text.Megaparsec.Char
+import qualified Text.Megaparsec
 import qualified Control.Monad.Combinators.Expr as E 
-import Data.Maybe
 import qualified Data.List
-import Data.Map.Strict hiding (foldr', map, drop, foldl')
+import qualified Data.Set as Set
+import qualified Data.Map.Strict as Map
+import qualified Text.Megaparsec.Char.Lexer as L
+import System.Process hiding (env)
+import Data.Text (Text)
+import Text.Megaparsec hiding (State, Pos, empty)
+import Text.Megaparsec.Char
+import Data.Maybe
+import Data.Map.Strict (Map, (!?))
 import Data.Void (Void)
 import Data.Functor
 import Data.Foldable
@@ -19,7 +23,6 @@ import Control.Monad.State
 import Control.Monad.Except
 import Lens.Micro.Platform hiding (at)
 import Control.Monad.Identity
-import qualified Text.Megaparsec.Char.Lexer as L
 
 type Parser = Parsec Void Text
 
@@ -48,6 +51,7 @@ data LimeExpr =
     | FunCall LimeNode LimeNode
     | Lambda [LimeNode] LimeNode
     | Let LimeNode LimeNode
+    -- | DoBlock [LimeNode]
     deriving Show
 
 type Pos = (SourcePos, SourcePos)
@@ -55,15 +59,24 @@ type Pos = (SourcePos, SourcePos)
 data LimeNode = LimeNode
     { _expr :: LimeExpr
     , _pos  :: Pos
-    , _info :: TypeInfo
+    , _info :: LimeType
     }
     deriving Show
 
+lineComment :: Parser ()
+lineComment = L.skipLineComment "--"
+
+scn :: Parser ()
+scn = L.space hspace lineComment Text.Megaparsec.empty
+
+sc :: Parser ()
+sc = hspace --L.space hspace lineComment Text.Megaparsec.empty
+
 lexeme :: Parser a -> Parser a
-lexeme = L.lexeme hspace
+lexeme = L.lexeme sc
 
 symbol :: Text -> Parser Text
-symbol = L.symbol hspace
+symbol = L.symbol sc
 
 limeSymbol :: Parser LimeExpr
 limeSymbol = Symbol . T.pack <$> lexeme (some letterChar)
@@ -103,26 +116,36 @@ limeExprToNode p = do
 limeTerm :: Parser LimeNode
 limeTerm = limeTermToNode $ choice [limeInt, limeSymbol, lexeme limeLambda, lexeme limeLet] 
 
+-- limeTopLevel :: Parser LimeNode
+-- limeTopLevel = L.nonIndented scn $ E.makeExprParser limeNode table
+--     where table =
+--             [ [ binary "::" AssignType ]
+--             , [ binary "=" AssignValue ]
+--             ]
+--           binary s op = E.InfixL $ limeExprToNode (Infix op <$ symbol s)
+
 limeNode :: Parser LimeNode
 limeNode = E.makeExprParser limeTerm table
     where
         table = 
           [ [ binary' "" FunCall
             ]
-          , [ binary "+" Add
-            , binary'' "-" Sub
+          , [ binaryF "+" Add
+            , binaryF' "-" Sub
             ] 
-          , [ binary "*" Mul
-            , binary "/" Div
+          , [ binaryF "*" Mul
+            , binaryF "/" Div
             ]
           , [ binaryR "->" FunArrow
             ]
-          , [ binary "="  AssignValue
-            , binary "::" AssignType
+          , [ binary "::" AssignType
+            , binary "=" AssignValue
             ]
           ]
         binary s op = E.InfixL $ limeExprToNode (Infix op <$ symbol s)
-        binary'' s op = E.InfixL $ limeExprToNode (Infix op <$ try (symbol s <* notFollowedBy (symbol ">")))
+        -- parse ops like a + b as function calls
+        binaryF s op = E.InfixL $ limeExprToNode (Infix op <$ symbol s)
+        binaryF' s op = E.InfixL $ limeExprToNode (Infix op <$ try (symbol s <* notFollowedBy (symbol ">")))
         binary' s op = E.InfixL $ limeExprToNode (op <$ symbol s)
         binaryR s op = E.InfixR $ limeExprToNode (Infix op <$ symbol s)
 
@@ -205,146 +228,87 @@ data Value =
 --     FunCall l r -> "(" <> toLisp l <> " " <> toLisp r <> ")"
 --     _ -> ""
 
-data TypeInfo =
+data LimePrim
+    -- size, signedness, name
+    = PInt Int Bool Text
+    -- size, name
+    | PFloat Int Text
+    deriving (Show, Eq)
+
+data LimeType =
     -- arg ret
-    FuncInfo TypeInfo TypeInfo
-    -- byte size
-    | FloatInfo Int Text
-    -- byte size, signed
-    | IntInfo Int Bool Text
-    -- literals
-    | StringLit
-    | IntLit
-    | FloatLit
-    -- undetermined, but handled, only for variables
-    | Undet
+    TLambda LimeType LimeType
+    -- type vars
+    | TVar Int
+    | TPrim LimePrim
     -- no assigned type
     | Unchecked
     deriving (Show, Eq)
 
-printType :: TypeInfo -> Text
+printType :: LimeType -> Text
 printType = \case
-    FuncInfo a r -> "(" <> printType a <> " -> " <> printType r <> ")"
-    FloatInfo _ t -> t
-    IntInfo _ _ t -> t
-    StringLit -> "StringLit"
-    IntLit -> "IntLit"
-    FloatLit -> "FloatLit"
-    Undet -> "Undet"
+    TLambda a r -> "(" <> printType a <> " -> " <> printType r <> ")"
+    TPrim p -> case p of
+        PInt _ _ n -> n
+        PFloat _ n -> n
+    TVar i -> "p" <> T.pack (show i)
     Unchecked -> "Unchecked"
 
-data CheckedNode = CheckedNode LimeNode TypeInfo
+data CheckedNode = CheckedNode LimeNode LimeType
     deriving Show
 
-type Scope = Map Text TypeInfo
+data Scheme = Forall [Int] LimeType
+    deriving Show
+
+type TypeEnv = Map Text Scheme
+type Subst = Map Int LimeType
 
 data TypecheckerState = TypecheckerState
-    { _locals  :: [Scope]
-    , _globals :: Scope
-    , _types   :: Scope
+    { _curTVar       :: Int
     }
     deriving Show
 
 makeLenses ''TypecheckerState
 
-type Typechecker a = ExceptT (Pos, String) (State TypecheckerState) a
+data TypecheckError 
+    = TEInfiniteType
+    | TEMismatch LimeType LimeType
+    | TEVarNotFound Text
+    | TEUnsupportedExpr LimeNode
+    | TEUnsupportedTLExpr LimeNode
+    deriving Show
 
-addScope :: [(Text, TypeInfo)] -> Typechecker ()
-addScope a = locals %= (fromList a:)
+type Typechecker a = ExceptT (Pos, TypecheckError) (State TypecheckerState) a
 
-removeScope :: Typechecker ()
-removeScope = locals %= drop 1
+instantiate :: Scheme -> Typechecker LimeType
+instantiate (Forall as t) = do
+    -- this seems dumb
+    as' <- mapM (const freshTVar) as
+    let s = Map.fromList $ zip as as'
+    pure $ apply s t
 
-findVar :: Text -> Typechecker (Maybe TypeInfo)
-findVar n = do
-    s <- use locals
-    g <- use globals
-    pure $ case find (member n) s of
-        Just a -> Just $ a ! n
-        Nothing -> g !? n
+findVarEnv :: TypeEnv -> Text -> Typechecker (Maybe LimeType)
+findVarEnv env n = case env !? n of
+    Just a -> instantiate a >>= \t -> pure $ Just t
+    Nothing -> pure Nothing
 
-findVarError :: Text -> Pos -> Typechecker TypeInfo
-findVarError n pos = findVar n >>= \case
+findVarError :: TypeEnv -> Text -> Pos -> Typechecker LimeType
+findVarError env n pos = findVarEnv env n >>= \case
     Just a -> pure a
-    Nothing -> throwError (pos, "variable \"" <> T.unpack n <> "\" does not exist")
+    Nothing -> throwError (pos, TEVarNotFound n)
 
-findType :: Text -> Typechecker (Maybe TypeInfo)
-findType n = do
-    ts <- use types
-    pure $ ts !? n
-
-findTypeError :: Text -> Pos -> Typechecker TypeInfo
-findTypeError n pos = findType n >>= \case
-    Just a -> pure a
-    Nothing -> throwError (pos, "type \"" <> T.unpack n <> "\" does not exist")
-
--- typeEq :: LimeNode -> LimeNode
-
--- typeError :: Pos -> Text -> Typechecker ()
--- typeError pos msg = do
-
--- checkRequirementsInternal :: [Text] -> TypeInfo -> Typechecker Bool
--- checkRequirementsInternal reqs t = 
-
-
-data Side = L | R
-
-checkTypeEqInternal :: TypeInfo -> TypeInfo -> Typechecker (Maybe TypeInfo)
-checkTypeEqInternal a b
-    | a == b = pure $ Just a 
-    | a == Undet && b /= Undet = pure $ Just b
-    | b == Undet && a /= Undet = pure $ Just a
-    | otherwise = pure Nothing
-
--- requires manual var concretization
-checkTypeEq :: TypeInfo -> TypeInfo -> Pos -> String -> Typechecker TypeInfo
-checkTypeEq a b pos msg = checkTypeEqInternal a b >>= \case
-    Just v -> pure v
-    Nothing -> throwError (pos, msg)
-
-updateVar :: Text -> TypeInfo -> Typechecker ()
-updateVar n t = do
-    s <- use locals
-    case Data.List.findIndex (member n) s of
-        Just a -> locals . ix a %= insert n t
-        Nothing -> globals %= insert n t
-
-concretizeUndetVar :: LimeNode -> TypeInfo -> Typechecker ()
-concretizeUndetVar (LimeNode ne _ ni) t =
-    if ni == Undet then case ne of
-        Symbol s -> updateVar s t
-        _ -> pure ()
-    else pure ()
-
-
-checkNodeTypeEq :: LimeNode -> LimeNode -> Pos -> Typechecker (LimeNode, LimeNode)
-checkNodeTypeEq a@(LimeNode _ _ ai) b@(LimeNode _ _ bi) pos = checkTypeEqInternal ai bi >>= \case
-    Just ti -> do
-        concretizeUndetVar a ti
-        concretizeUndetVar b ti
-        pure (a { _info = ti }, b { _info = ti })
-    Nothing -> throwError (pos, "types do not match")
-
-infixTypeEq :: LimeNode -> Typechecker LimeNode
-infixTypeEq n@(LimeNode (Infix op l r) pos _) = do
-    lp <- typecheck l
-    rp <- typecheck r
-    (lpm, rpm) <- checkNodeTypeEq lp rp pos
-    pure $ n { 
-        _expr = Infix op lpm rpm,
-        _info = _info lpm
-        }
-
-typeLevelEval :: LimeNode -> Typechecker LimeNode
-typeLevelEval n@(LimeNode node pos _) = case node of
-    Symbol s -> (\v -> n { _info = v }) <$> findTypeError s pos 
+typeLevelEval :: TypeEnv -> LimeNode -> Typechecker Scheme
+typeLevelEval env n@(LimeNode node pos _) = case node of
+    Symbol s -> case env !? s of
+        Just a -> pure a
+        Nothing -> throwError (pos, TEVarNotFound s)
     Infix FunArrow l r -> do
-        lt@(LimeNode _ _ li) <- typeLevelEval l
-        rt@(LimeNode _ _ ri) <- typeLevelEval r
-        pure $ n { _expr = Infix FunArrow lt rt, _info = FuncInfo li ri }
-    _ -> throwError (pos, "unsupported type-level expression")
+        (Forall lvs lt) <- typeLevelEval env l
+        (Forall rvs rt) <- typeLevelEval env r
+        pure $ Forall [] $ TLambda lt rt
+    _ -> throwError (pos, TEUnsupportedTLExpr n)
 
--- patternMatch :: LimeNode -> Typechecker (Maybe (TypeInfo, [TypeInfo]))
+-- patternMatch :: LimeNode -> Typechecker (Maybe (LimeType, [LimeType]))
 -- patternMatch (LimeNode lhs lpos _) = case lhs of
 --         Symbol l -> findVar l >>= \case
 --             Just a -> pure $ Just (a, [])
@@ -352,62 +316,134 @@ typeLevelEval n@(LimeNode node pos _) = case node of
 --         -- add holes as a possibility
 --         FunCall (LimeNode (Symbol ls) _ _) (LimeNode (Symbol rs) _ _) -> pure ()
 
-typecheck :: LimeNode -> Typechecker LimeNode
-typecheck n@(LimeNode node pos _) = case node of
-    Infix AssignType ln@(LimeNode (Symbol l) lpos _) r -> do
-        findVar l >>= \case
-            Just _ -> throwError (lpos, "can't redefine variable \"" <> T.unpack l <> "\"")
-            Nothing -> pure ()
-        rt@(LimeNode _ _ t) <- typeLevelEval r
-        globals %= insert l t
-        pure $ n { _expr = Infix AssignType (ln { _info = t }) rt, _info = t }
-    -- treated like symbol now but will be pattern match in the future
-    Infix AssignValue nl@(LimeNode (Symbol l) _ _) r -> do
-        rtn@(LimeNode _ _ t) <- typecheck r
-        ti <- findVar l >>= \case
-            Just a -> checkTypeEq a t pos "types do not match"
-            Nothing -> do
-                globals %= insert l t 
-                pure t 
-        -- need to update inner node
-        pure $ n { _expr = Infix AssignValue nl rtn, _info = ti }
-    Lambda [ln@(LimeNode (Symbol a) _ _)] r@(LimeNode _ rpos _) -> do
-        addScope [(a, Undet)]
-        rtn@(LimeNode _ _ t) <- typecheck r
-        at <- findVarError a pos
-        removeScope
-        if at == Undet then throwError (rpos, "type of " <> T.unpack a <> " could not be determined") else pure ()
-        pure $ n { _expr = Lambda [(ln { _info = at })] rtn, _info = FuncInfo at t }
-    Infix Add _ _ -> infixTypeEq n
-    Infix Sub _ _ -> infixTypeEq n
-    Infix Mul _ _ -> infixTypeEq n
-    Infix Div _ _ -> infixTypeEq n
-    FunCall f a -> do
-        ft@(LimeNode _ fpos fi) <- typecheck f
-        at@(LimeNode _ apos ai) <- typecheck a
-        case fi of
-            FuncInfo arg ret -> do
-                ti <- checkTypeEq arg ai apos $ "incorrect function argument, expected " <> show arg
-                -- concretizeUndetVar at ti
-                pure $ n { _expr = FunCall ft at, _info = ret }
-            _ -> throwError (fpos, "cannot call non-function")
-    -- return IntLit later
-    Int _ -> pure $ n { _info = IntInfo 4 True "Int"}
-    Symbol s -> (\v -> n { _info = v }) <$> findVarError s pos
-        
-    -- catch all so the darn language server doesn't complain
-    _ -> throwError (pos, "unsupported expression " <> show n)
+freshTVar :: Typechecker LimeType
+freshTVar = do
+    n <- use curTVar
+    curTVar %= (+1)
+    pure $ TVar n
 
-defaultTypes :: Scope
-defaultTypes = fromList 
-    [ ("Int", IntInfo 4 True "Int"),
-      ("Float", FloatInfo 4 "Float")
+schemeType :: Scheme -> LimeType
+schemeType (Forall _ t) = t
+
+getType :: LimeNode -> LimeType
+getType (LimeNode _ _ t) = t
+
+apply :: Subst -> LimeType -> LimeType
+apply s t@(TVar v) = Map.findWithDefault t v s
+apply s (TLambda a r) = TLambda (apply s a) (apply s r)
+apply _ t = t
+
+applyS :: Subst -> Scheme -> Scheme
+applyS s (Forall as t) = Forall as $ apply s t
+
+applyEnv :: Subst -> TypeEnv -> TypeEnv
+applyEnv s env = Map.map (applyS s) env
+
+-- instantiate :: a -> a
+-- instantiate = id
+
+unify :: Pos -> LimeType -> LimeType -> Typechecker Subst
+unify pos (TLambda l1 r1) (TLambda l2 r2) = do
+    s1 <- unify pos l1 l2
+    s2 <- unify pos (apply s1 r1) (apply s1 r2)
+    pure $ Map.union s2 s1
+unify pos (TVar a) t = bind pos a t
+unify pos t (TVar a) = bind pos a t
+unify _ (TPrim a) (TPrim b) | a == b = pure Map.empty
+unify pos t1 t2 = throwError $ (pos, TEMismatch t1 t2)
+
+occurs :: Int -> LimeType -> Bool
+occurs v = \case
+    TLambda t1 t2 -> occurs v t1 && occurs v t2
+    TVar v' -> v == v'
+    TPrim _ -> False
+    Unchecked -> False
+
+bind :: Pos -> Int -> LimeType -> Typechecker Subst
+bind pos a t
+    | t == TVar a = return Map.empty
+    | occurs a t  = throwError (pos, TEInfiniteType)
+    | otherwise   = pure $ Map.singleton a t
+
+replaceType :: LimeNode -> LimeType -> LimeNode
+replaceType n t = n { _info = t }
+
+applyN :: Subst -> LimeNode -> LimeNode
+applyN s n@(LimeNode _ _ t) = n { _info = apply s t }
+
+freeTypeVars :: LimeType -> Set.Set Int
+freeTypeVars = \case
+    TLambda a r -> freeTypeVars a `Set.union` freeTypeVars r
+    TVar a -> Set.singleton a
+    TPrim _ -> Set.empty
+    Unchecked -> Set.empty
+
+freeTypeVarsS :: Scheme -> Set.Set Int
+freeTypeVarsS (Forall vs t) = freeTypeVars t `Set.difference` Set.fromList vs
+
+freeTypeVarsEnv :: TypeEnv -> Set.Set Int
+freeTypeVarsEnv env = foldl' (flip $ Set.union . freeTypeVarsS) Set.empty $ Map.elems env
+
+generalize :: TypeEnv -> LimeType -> Scheme
+generalize env t = Forall as t
+    where as = Set.toList $ freeTypeVars t `Set.difference` freeTypeVarsEnv env
+
+typecheck :: TypeEnv -> LimeNode -> Typechecker (Subst, LimeNode)
+typecheck env n@(LimeNode node pos _) = case node of
+    Symbol s -> do
+        (\v -> (Map.empty, n { _info = v })) <$> findVarError env s pos
+    Lambda l@[LimeNode (Symbol a) _ _] r@(LimeNode _ _ _) -> do
+        tv <- freshTVar
+
+        let env' = Map.insert a (Forall [] tv) env
+        (s1, r'@(LimeNode _ _ t1)) <- typecheck env' r
+        
+        pure (s1, n { _expr = Lambda l r', _info = apply s1 (TLambda tv t1) })
+    FunCall f a -> do
+        tv <- freshTVar
+        (s1, f') <- typecheck env f
+        (s2, a') <- typecheck (applyEnv s1 env) a
+        s3 <- unify pos (apply s2 $ getType f') (TLambda (getType a') tv)
+        pure (Map.unions [s3, s2, s1], n { _expr = FunCall f' a', _info = apply s3 tv })
+    Int _ -> pure $ (Map.empty, n { _info = TPrim $ PInt 4 True "Int"})
+
+    -- catch all so the darn language server doesn't complain
+    _ -> throwError (pos, TEUnsupportedExpr n)
+
+topLevelTypecheck :: TypeEnv -> LimeNode -> Typechecker (TypeEnv, LimeNode)
+topLevelTypecheck env n@(LimeNode expr pos _) = case expr of
+    Infix AssignType l@(LimeNode (Symbol s) _ _) r -> do
+        rt <- typeLevelEval env r
+        curTVar .= 0
+        pure $ (Map.insert s rt env, n)
+    Infix AssignValue a@(LimeNode (Symbol s) _ _) b -> do
+        (s1, b') <- typecheck env b
+        let env'  = applyEnv s1 env
+            t'    = generalize env' $ getType b'
+        env'' <- case env !? s of
+            Just x -> unify pos (schemeType x) (schemeType t') >>= \_ -> pure env
+            Nothing -> pure $ Map.insert s t' env
+        curTVar .= 0
+        pure $ (env'', n { _expr = Infix AssignValue a b', _info = getType b' })
+    _ -> (\(_, b) -> (env, b)) <$> typecheck env n
+
+defaultTypes :: TypeEnv
+defaultTypes = Map.fromList 
+    [ ("Int", Forall [] $ TPrim $ PInt 4 True "Int"),
+      ("Float", Forall [] $ TPrim $ PFloat 4 "Float")
     ]
 
-typecheckAll :: [LimeNode] -> Typechecker [LimeNode]
-typecheckAll = traverse typecheck
+typecheckAllI :: [LimeNode] -> TypeEnv -> Typechecker (TypeEnv, [LimeNode])
+typecheckAllI [] env = pure (env, [])
+typecheckAllI (n:ns) env = do
+    (env', n') <- topLevelTypecheck env n
+    (env'', n2) <- typecheckAllI ns env'
+    pure $ (env'', n':n2)
 
-printPos :: Pos -> Text -> String -> IO ()
+typecheckAll :: [LimeNode] -> Typechecker (TypeEnv, [LimeNode])
+typecheckAll ns = typecheckAllI ns defaultTypes
+
+printPos :: Pos -> Text -> TypecheckError -> IO ()
 printPos (SourcePos sf sln scn, SourcePos ef eln ecn) text msg = do
     let line :: Int
         line = unPos sln - 1
@@ -421,17 +457,20 @@ printPos (SourcePos sf sln scn, SourcePos ef eln ecn) text msg = do
     putStrLn $ replicate lnsl ' ' <> "|"
     putStrLn $ lns <> " | " <> l
     putStrLn $ replicate lnsl ' ' <> "| " <> replicate (unPos scn - 1) ' ' <> replicate (unPos ecn - unPos scn) '^'
-    putStrLn msg
+    case msg of
+        TEInfiniteType -> putStrLn "infinite type"
+        TEMismatch t1 t2 -> T.putStrLn $ "type mismatch: " <> printType t1 <> " and " <> printType t2
+        TEVarNotFound n -> T.putStrLn $ "variable not found: " <> n
+        TEUnsupportedExpr n -> putStrLn $ "unsupported expr: " <> show n
+        TEUnsupportedTLExpr n -> putStrLn $ "unsupported type level expr: " <> show n 
 
-printTypeGo :: TypeInfo -> Text
+printTypeGo :: LimeType -> Text
 printTypeGo = \case
-    FuncInfo a r -> "func (" <> printTypeGo a <> ") " <> printTypeGo r
-    FloatInfo _ t -> "float"
-    IntInfo _ _ t -> "int"
-    StringLit -> "StringLit"
-    IntLit -> "IntLit"
-    FloatLit -> "FloatLit"
-    Undet -> "Undet"
+    TLambda a r -> "func (" <> printTypeGo a <> ") " <> printTypeGo r
+    TVar v -> T.pack $ show v
+    TPrim p -> case p of
+        PFloat _ _ -> "float"
+        PInt _ _ _ -> "int"
     Unchecked -> "Unchecked"
 
 goBackend :: LimeNode -> Text
@@ -440,7 +479,7 @@ goBackend n@(LimeNode node pos info) = case node of
     Infix AssignValue (LimeNode (Symbol "main") _ _) r -> "func main () {\n    fmt.Println(" <> goBackend r <> ")\n}"
     Infix AssignValue l r -> "var " <> goBackend l <> " = " <> goBackend r
     Lambda [ln@(LimeNode (Symbol a) _ _)] r -> "func (" <> a <> " " <> printTypeGo arg <> ") " <> printTypeGo ret <> " {\n" <> "    return " <> goBackend r <> "\n}"
-        where (FuncInfo arg ret) = info
+        where (TLambda arg ret) = info
     Infix Add a b -> goBackend a <> " + " <> goBackend b
     Infix Sub a b -> goBackend a <> " - " <> goBackend b
     Infix Mul a b -> goBackend a <> " * " <> goBackend b
@@ -451,25 +490,33 @@ goBackend n@(LimeNode node pos info) = case node of
     -- catch all so the darn language server doesn't complain
     _ -> "" --throwError (pos, "unsupported expression " <> show n)
 
+-- printScheme :: Scheme -> Text
+-- printScheme (Forall vs t) = foldl' (\b a -> b <> (T.pack $ show a) <> " ") "" vs <> "=> " <> printType t
+
+printTypeEnv :: TypeEnv -> Text
+printTypeEnv env = foldl' (\b (n, t) -> b <> n <> " :: " <> printType (schemeType t) <> "\n") "" $ Map.toList env
+
 main :: IO ()
 main = do
     test <- T.readFile "test.lm"
     let parsed = runParser program "test.lm" test 
-    print parsed
-    putStr "\n"
     case parsed of
         Right p -> do
             -- runStateT (runExceptT $ for_ p eval) (InterpreterState Data.Map.Strict.empty []) >>= print
             -- print $ T.intercalate "\n" $ map toLisp p
-            -- let simplified = map simplifyLime p
-            -- traverse_ (T.putStrLn . printNode) simplified
-            let Identity (r, s) = runStateT (runExceptT $ typecheckAll p) (TypecheckerState [] Data.Map.Strict.empty defaultTypes)
+            let simplified = map simplifyLime p
+            traverse_ (T.putStrLn . printNode) simplified
+            putStrLn ""
+            let Identity (r, s) = runStateT (runExceptT $ typecheckAll simplified) (TypecheckerState 0)
             case r of
                 Left (pos, msg) -> do
                     printPos pos test msg
                     putStr "\n"
-                    print s
-                Right a -> do
-                    T.writeFile "out.go" $ Data.Foldable.foldl' (\b a -> b <> "\n" <> goBackend a) "package main\n\nimport fmt \"fmt\"" a
-                    callCommand "go run out.go"
+                Right (env, ns) -> do
+                    T.putStrLn $ printTypeEnv env
+                    -- case env !? "joe" of
+                    --     Just t -> T.putStrLn $ printType $ schemeType t
+                    --     Nothing -> pure ()
+                    -- T.writeFile "out.go" $ Data.Foldable.foldl' (\b a -> b <> "\n" <> goBackend a) "package main\n\nimport fmt \"fmt\"" a
+                    -- callCommand "go run out.go"
         Left e -> putStrLn $ errorBundlePretty e

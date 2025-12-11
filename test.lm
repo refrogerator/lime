@@ -1,1 +1,6 @@
-joe = \a b -> a + b + 5
+joe :: Int -> Int -> Float -> Float
+joe = \a b -> a
+
+ball = \a -> a
+
+main = joe 1 2
