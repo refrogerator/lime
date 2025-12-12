@@ -158,8 +158,17 @@ simplifyLambda [a] r pos = LimeNode (Lambda [a] r) pos Unchecked
 simplifyLambda (a:as) r pos =
     LimeNode (Lambda [a] $ simplifyLambda as r pos) pos Unchecked
 
+patternMatch :: LimeNode -> LimeNode -> (LimeNode, LimeNode)
+patternMatch lhsn@(LimeNode lhs _ _) rhs@(LimeNode _ rpos _) = case lhs of
+    FunCall ln@(LimeNode (Symbol l) _ _) r@(LimeNode (Symbol _) _ _) -> (ln, (LimeNode (Lambda [r] rhs) rpos Unchecked))
+    FunCall l r@(LimeNode (Symbol _) _ _) -> patternMatch l (LimeNode (Lambda [r] rhs) rpos Unchecked)
+    Symbol _ -> (lhsn, rhs)
+
 simplifyLime :: LimeNode -> LimeNode
 simplifyLime n@(LimeNode node pos _) = case node of
+    Infix AssignValue l r -> 
+        n { _expr = Infix AssignValue l' r' }
+        where (l', r') = patternMatch l $ simplifyLime r
     Infix op l r ->
         n { _expr = Infix op (simplifyLime l) (simplifyLime r) }
     Lambda a r ->
@@ -210,23 +219,6 @@ data Value =
     | VFunc LimeNode
     | VNone
     deriving (Show)
-
--- toLisp :: LimeNode -> Text
--- toLisp node = case node of
---     Infix AssignType l r -> ""
---     Infix AssignValue (Symbol name) r -> "(define (" <> name <> ") " <> toLisp r <> ")"
---     Infix arithOp l r -> do
---         let a = toLisp l
---             b = toLisp r
---         case arithOp of
---             Add -> "(+ " <> a <> " " <> b <> ")"
---             Sub -> "(- " <> a <> " " <> b <> ")"
---             Mul -> "(* " <> a <> " " <> b <> ")"
---             Div -> "(/ " <> a <> " " <> b <> ")"
---     Float a -> T.pack $ show a
---     Symbol a -> a
---     FunCall l r -> "(" <> toLisp l <> " " <> toLisp r <> ")"
---     _ -> ""
 
 data LimePrim
     -- size, signedness, name
@@ -307,14 +299,6 @@ typeLevelEval env n@(LimeNode node pos _) = case node of
         (Forall rvs rt) <- typeLevelEval env r
         pure $ Forall [] $ TLambda lt rt
     _ -> throwError (pos, TEUnsupportedTLExpr n)
-
--- patternMatch :: LimeNode -> Typechecker (Maybe (LimeType, [LimeType]))
--- patternMatch (LimeNode lhs lpos _) = case lhs of
---         Symbol l -> findVar l >>= \case
---             Just a -> pure $ Just (a, [])
---             Nothing -> pure Nothing
---         -- add holes as a possibility
---         FunCall (LimeNode (Symbol ls) _ _) (LimeNode (Symbol rs) _ _) -> pure ()
 
 freshTVar :: Typechecker LimeType
 freshTVar = do

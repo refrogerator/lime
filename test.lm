@@ -1,5 +1,5 @@
-joe :: Int -> Int -> Float -> Float
-joe = \a b -> a
+joe :: Int -> Int -> Int
+joe a b = a
 
 ball = \a -> a
 
