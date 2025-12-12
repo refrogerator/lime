@@ -1,6 +1,4 @@
-joe :: Int -> Int -> Int
-joe a b = a
+joe a b = a + b + 5
 
-ball = \a -> a
-
+main :: Int
 main = joe 1 2
