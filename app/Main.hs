@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE Strict #-}
 
 module Main where
 
@@ -19,6 +20,7 @@ import Data.Map.Strict (Map, (!?))
 import Data.Void (Void)
 import Data.Functor
 import Data.Foldable
+import Data.Traversable
 import Control.Monad.State
 import Control.Monad.Except
 import Lens.Micro.Platform hiding (at)
@@ -51,6 +53,8 @@ data LimeExpr =
     | FunCall LimeNode LimeNode
     | Lambda [LimeNode] LimeNode
     | Let LimeNode LimeNode
+    -- name members
+    | Data Text [Text]
     -- | DoBlock [LimeNode]
     deriving Show
 
@@ -92,6 +96,14 @@ limeLet = do
     right <- limeNode
     pure $ Let left right
 
+limeData :: Parser LimeExpr
+limeData = do
+    _ <- symbol "data"
+    left <- T.pack <$> lexeme (some letterChar)
+    _ <- symbol "="
+    right <- (T.pack <$> lexeme (some letterChar)) `sepBy` symbol "|"
+    pure $ Data left right
+
 limeLambda :: Parser LimeExpr
 limeLambda = do
     _ <- symbol "\\"
@@ -114,7 +126,7 @@ limeExprToNode p = do
     pure (\a@(LimeNode _ (start, _) _) b@(LimeNode _ (_, end) _) -> LimeNode (r a b) (start, end) Unchecked)
 
 limeTerm :: Parser LimeNode
-limeTerm = limeTermToNode $ choice [limeInt, limeSymbol, lexeme limeLambda, lexeme limeLet] 
+limeTerm = limeTermToNode $ choice [limeData, limeInt, limeSymbol, lexeme limeLambda, lexeme limeLet] 
 
 -- limeTopLevel :: Parser LimeNode
 -- limeTopLevel = L.nonIndented scn $ E.makeExprParser limeNode table
@@ -198,6 +210,7 @@ simplifyLime n@(LimeNode node pos _) = case node of
         n { expr = Prefix op $ simplifyLime r }
     Let l r ->
         n { expr = Let (simplifyLime l) (simplifyLime r) }
+    Data a b -> n
 
 printNode :: LimeNode -> Text
 printNode n@(LimeNode node _ _) = case node of
@@ -219,6 +232,7 @@ printNode n@(LimeNode node _ _) = case node of
     Bool b -> T.pack $ show b
     String s -> s
     List s -> "[" <> foldl' (\b a -> b <> printNode a <> " ") "" s <> "]"
+    Data n ns -> "data " <> n <> " = " <> foldl' (\b a -> b <> a <> " | ") "" ns
     Prefix op r ->
         ""
     Let l r ->
@@ -247,6 +261,7 @@ data LimeType =
     -- type vars
     | TVar Int
     | TPrim LimePrim
+    | TADT Text [Text]
     -- no assigned type
     | Unchecked
     deriving (Show, Eq)
@@ -258,6 +273,7 @@ printType = \case
         PInt _ _ n -> n
         PFloat _ n -> n
     TVar i -> "p" <> T.pack (show i)
+    TADT n _ -> n
     Unchecked -> "Unchecked"
 
 data CheckedNode = CheckedNode LimeNode LimeType
@@ -345,6 +361,7 @@ unify pos (TLambda l1 r1) (TLambda l2 r2) = do
 unify pos (TVar a) t = bind pos a t
 unify pos t (TVar a) = bind pos a t
 unify _ (TPrim a) (TPrim b) | a == b = pure Map.empty
+unify _ (TADT na _) (TADT nb _) | na == nb = pure Map.empty
 unify pos t1 t2 = throwError $ (pos, TEMismatch t1 t2)
 
 occurs :: Int -> LimeType -> Bool
@@ -352,6 +369,8 @@ occurs v = \case
     TLambda t1 t2 -> occurs v t1 && occurs v t2
     TVar v' -> v == v'
     TPrim _ -> False
+    -- TODO fix occurs check for ADT
+    TADT n ns -> False
     Unchecked -> False
 
 bind :: Pos -> Int -> LimeType -> Typechecker Subst
@@ -371,6 +390,8 @@ freeTypeVars = \case
     TLambda a r -> freeTypeVars a `Set.union` freeTypeVars r
     TVar a -> Set.singleton a
     TPrim _ -> Set.empty
+    -- TODO fix tvar check for ADTS once generic
+    TADT n ns -> Set.empty
     Unchecked -> Set.empty
 
 freeTypeVarsS :: Scheme -> Set.Set Int
@@ -420,6 +441,11 @@ topLevelTypecheck env n@(LimeNode expr pos _) = case expr of
             Nothing -> pure $ Map.insert s t' env
         curTVar .= 0
         pure $ (env'', n { expr = Infix AssignValue a b', info = getType b' })
+    Data name ms ->
+        let t = TADT name ms
+            env' = Map.insert name (Forall [] t) env
+            env'' = foldl' (\b a -> Map.insert a (Forall [] t) b) env' ms
+        in pure $ (env'', n { info = t })
     _ -> (\(_, b) -> (env, b)) <$> typecheck env n
 
 infixType :: LimeType -> LimeType
@@ -476,19 +502,18 @@ printTypeGo = \case
     TPrim p -> case p of
         PFloat _ _ -> "float"
         PInt _ _ _ -> "int"
+    TADT _ _ -> "int"
     Unchecked -> "Unchecked"
 
 goBackend :: LimeNode -> Text
 goBackend n@(LimeNode node pos info) = case node of
+    Data _ ms -> fst $ foldl' f ("", 0) ms
+        where f (b, c) a = (b <> "var " <> a <> " = " <> T.pack (show c) <> "\n", c+1)
     Infix AssignType _ _ -> ""
     Infix AssignValue (LimeNode (Symbol "main") _ _) r -> "func main () {\n    fmt.Println(" <> goBackend r <> ")\n}"
     Infix AssignValue l r -> "var " <> goBackend l <> " = " <> goBackend r
     Lambda [ln@(LimeNode (Symbol a) _ _)] r -> "func (" <> a <> " " <> printTypeGo arg <> ") " <> printTypeGo ret <> " {\n" <> "    return " <> goBackend r <> "\n}"
         where (TLambda arg ret) = info
-    Infix Add a b -> goBackend a <> " + " <> goBackend b
-    Infix Sub a b -> goBackend a <> " - " <> goBackend b
-    Infix Mul a b -> goBackend a <> " * " <> goBackend b
-    Infix Div a b -> goBackend a <> " / " <> goBackend b
     FunCall f a -> goBackend f <> "(" <> goBackend a <> ")"
     Int v -> T.pack $ show v
     Symbol s -> s

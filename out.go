@@ -26,12 +26,10 @@ func __div(a int) func (int) int {
 	}
 }
 
-var joe = func (a int) func (int) int {
-    return func (b int) int {
-    return __add(__add(a)(b))(5)
-}
-}
+var True = 0
+var False = 1
+
 
 func main () {
-    fmt.Println(joe(1)(2))
+    fmt.Println(True)
 }

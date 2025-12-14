@@ -1,4 +1,4 @@
-joe a b = a + b + 5
+data Bool = True | False
 
-main :: Int
-main = joe 1 2
+main :: Bool
+main = True
