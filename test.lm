@@ -1,4 +1,20 @@
-data Bool = True | False
+data Bool
+    = True 
+    | False
 
-main :: Bool
-main = True
+--
+-- main :: Bool
+-- main = True
+
+-- __add a b = 4
+
+p :: Float
+
+joe a = case a of
+    3 -> 4
+    4 -> 5
+
+main = 
+    4 + 5 -- gamer
+--
+-- joe a b = a + b
