@@ -26,8 +26,8 @@ import Control.Monad.State
 import Control.Monad.Except
 import Lens.Micro.Platform hiding (at)
 import Control.Monad.Identity
-import Debug.Trace (trace)
 
+-- not sure if ISInvalid is even needed
 data IndentationState = ISUnset Int | ISSet Int | ISInvalid deriving Show
 
 type Parser = ParsecT Void Text (State IndentationState)
@@ -482,6 +482,8 @@ generalize env t = Forall as t
 typecheckPatternMatch :: TypeEnv -> LimeNode -> Typechecker (Subst, LimeNode)
 typecheckPatternMatch env n@(LimeNode node npos _) = case node of
     Int _ -> pure $ (Map.empty, n { info = defInt })
+    Symbol s -> 
+        (\v -> (Map.empty, n { info = v })) <$> findVarError env s npos
     _ -> throwError (npos, TEUnsupportedPMExpr n)
 
 
