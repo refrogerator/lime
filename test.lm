@@ -14,7 +14,15 @@ joe a = case a of
     3 -> 4
     4 -> 5
 
+bean :: Bool -> Int
+bean a = case a of
+    True -> 6
+    False -> 7
+
+-- main :: Int
 main = 
     4 + 5 -- gamer
---
+
+data Test = Test Bool Int
+
 -- joe a b = a + b

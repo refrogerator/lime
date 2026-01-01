@@ -58,7 +58,7 @@ data LimeExpr =
     | Lambda [LimeNode] LimeNode
     | Let LimeNode LimeNode
     -- name members
-    | Data Text [Text]
+    | Data Text [(Text, [LimeNode])]
     -- value cases
     | Case LimeNode [(LimeNode, LimeNode)]
     -- | DoBlock [LimeNode]
@@ -126,7 +126,7 @@ limeData = do
     _ <- symbol "data"
     left <- T.pack <$> lexeme (some letterChar)
     _ <- symbol "="
-    right <- (T.pack <$> lexeme (some letterChar)) `sepBy` symbol "|"
+    right <- ((,) <$> (T.pack <$> lexeme (some letterChar)) <*> (many typeLevelNode)) `sepBy` symbol "|"
     pure $ Data left right
 
 caseBlock :: Parser [(LimeNode, LimeNode)]
@@ -204,11 +204,13 @@ limeTopLevel = L.nonIndented scn $ (put $ ISSet 1) *> indentBracket (limeTopLeve
             op <- choice $ lexeme <$>
                 [ AssignType <$ "::" 
                 , AssignValue <$ "=" ]
-            r <- limeNode
+            r <- case op of
+                AssignType -> typeLevelNode
+                AssignValue -> limeNode
             pure $ nodesToInfix op l r
 
 typeLevelNode :: Parser LimeNode
-typeLevelNode = E.makeExprParser limeTerm table
+typeLevelNode = E.makeExprParser (limeTermToNode limeSymbol) table
     where
         table =
             [ [ binaryR "->" FunArrow ] ]
@@ -305,7 +307,7 @@ printNode n@(LimeNode node _ _) = case node of
     Bool b -> T.pack $ show b
     String s -> s
     List s -> "[" <> foldl' (\b a -> b <> printNode a <> " ") "" s <> "]"
-    Data n ns -> "data " <> n <> " = " <> T.intercalate " | " ns
+    Data n ns -> "data " <> n <> " = " <> T.intercalate " | " (map (\(a, b) -> a <> " " <> (T.intercalate " " (map printNode b))) ns)
     Case v cs -> "case " <> printNode v <> " of\n    " <> (T.intercalate "\n    " $ map (\(l, r) -> printNode l <> " -> " <> printNode r) cs)
     Prefix op r ->
         ""
@@ -324,9 +326,9 @@ data Value =
 
 data LimePrim
     -- size, signedness, name
-    = PInt Int Bool Text
+    = PInt Int Bool
     -- size, name
-    | PFloat Int Text
+    | PFloat Int
     deriving (Show, Eq)
 
 data LimeType =
@@ -335,7 +337,8 @@ data LimeType =
     -- type vars
     | TVar Int
     | TPrim LimePrim
-    | TADT Text [Text]
+    | TADT Text [(Text, [LimeType])]
+    | TNamed Text LimeType
     -- no assigned type
     | Unchecked
     deriving (Show, Eq)
@@ -344,10 +347,11 @@ printType :: LimeType -> Text
 printType = \case
     TLambda a r -> "(" <> printType a <> " -> " <> printType r <> ")"
     TPrim p -> case p of
-        PInt _ _ n -> n
-        PFloat _ n -> n
+        PInt _ _ -> "Int" 
+        PFloat _ -> "Float"
     TVar i -> "p" <> T.pack (show i)
     TADT n _ -> n
+    TNamed t _ -> t
     Unchecked -> "Unchecked"
 
 data CheckedNode = CheckedNode LimeNode LimeType
@@ -356,7 +360,7 @@ data CheckedNode = CheckedNode LimeNode LimeType
 data Scheme = Forall [Int] LimeType
     deriving Show
 
-type TypeEnv = Map Text Scheme
+type TypeEnv = (Map Text Scheme, Map Text Scheme)
 type Subst = Map Int LimeType
 
 data TypecheckerState = TypecheckerState
@@ -370,6 +374,7 @@ data TypecheckError
     = TEInfiniteType
     | TEMismatch LimeType LimeType
     | TEVarNotFound Text
+    | TETypeNotFound Text
     | TEUnsupportedExpr LimeNode
     | TEUnsupportedPMExpr LimeNode
     | TEUnsupportedTLExpr LimeNode
@@ -380,12 +385,13 @@ type Typechecker a = ExceptT (Pos, TypecheckError) (State TypecheckerState) a
 instantiate :: Scheme -> Typechecker LimeType
 instantiate (Forall as t) = do
     -- this seems dumb
+    -- probably just need number of tvars instead of array of names
     as' <- mapM (const freshTVar) as
     let s = Map.fromList $ zip as as'
     pure $ apply s t
 
 findVarEnv :: TypeEnv -> Text -> Typechecker (Maybe LimeType)
-findVarEnv env n = case env !? n of
+findVarEnv (_, venv) n = case venv !? n of
     Just a -> instantiate a >>= \t -> pure $ Just t
     Nothing -> pure Nothing
 
@@ -394,11 +400,21 @@ findVarError env n pos = findVarEnv env n >>= \case
     Just a -> pure a
     Nothing -> throwError (pos, TEVarNotFound n)
 
+findTypeEnv :: TypeEnv -> Text -> Typechecker (Maybe LimeType)
+findTypeEnv (tenv, _) n = case tenv !? n of
+    Just a -> instantiate a >>= \t -> pure $ Just t
+    Nothing -> pure Nothing
+
+findTypeError :: TypeEnv -> Text -> Pos -> Typechecker LimeType
+findTypeError env n pos = findTypeEnv env n >>= \case
+    Just a -> pure a
+    Nothing -> throwError (pos, TETypeNotFound n)
+
 typeLevelEval :: TypeEnv -> LimeNode -> Typechecker Scheme
-typeLevelEval env n@(LimeNode node pos _) = case node of
-    Symbol s -> case env !? s of
+typeLevelEval env@(tenv, _) n@(LimeNode node pos _) = case node of
+    Symbol s -> case tenv !? s of
         Just a -> pure a
-        Nothing -> throwError (pos, TEVarNotFound s)
+        Nothing -> throwError (pos, TETypeNotFound s)
     Infix FunArrow l r -> do
         (Forall lvs lt) <- typeLevelEval env l
         (Forall rvs rt) <- typeLevelEval env r
@@ -426,9 +442,12 @@ applyS :: Subst -> Scheme -> Scheme
 applyS s (Forall as t) = Forall as $ apply s t
 
 applyEnv :: Subst -> TypeEnv -> TypeEnv
-applyEnv s env = Map.map (applyS s) env
+applyEnv s (tenv, venv) = (tenv, Map.map (applyS s) venv)
 
 unify :: Pos -> LimeType -> LimeType -> Typechecker Subst
+unify pos (TNamed _ a) (TNamed _ b) = unify pos a b
+unify pos (TNamed _ a) b = unify pos a b
+unify pos a (TNamed _ b) = unify pos a b
 unify pos (TLambda l1 r1) (TLambda l2 r2) = do
     s1 <- unify pos l1 l2
     s2 <- unify pos (apply s1 r1) (apply s1 r2)
@@ -445,7 +464,8 @@ occurs v = \case
     TVar v' -> v == v'
     TPrim _ -> False
     -- TODO fix occurs check for ADT
-    TADT n ns -> False
+    TADT _ _ -> False
+    TNamed _ t -> occurs v t
     Unchecked -> False
 
 bind :: Pos -> Int -> LimeType -> Typechecker Subst
@@ -466,14 +486,16 @@ freeTypeVars = \case
     TVar a -> Set.singleton a
     TPrim _ -> Set.empty
     -- TODO fix tvar check for ADTS once generic
-    TADT n ns -> Set.empty
+    TADT _ _ -> Set.empty
+    TNamed _ t -> freeTypeVars t
     Unchecked -> Set.empty
 
 freeTypeVarsS :: Scheme -> Set.Set Int
 freeTypeVarsS (Forall vs t) = freeTypeVars t `Set.difference` Set.fromList vs
 
+-- might cause trouble later, will use this with tenv aswell in case it does
 freeTypeVarsEnv :: TypeEnv -> Set.Set Int
-freeTypeVarsEnv env = foldl' (flip $ Set.union . freeTypeVarsS) Set.empty $ Map.elems env
+freeTypeVarsEnv env = foldl' (flip $ Set.union . freeTypeVarsS) Set.empty $ Map.elems $ snd env
 
 generalize :: TypeEnv -> LimeType -> Scheme
 generalize env t = Forall as t
@@ -494,7 +516,7 @@ typecheck env n@(LimeNode node npos _) = case node of
     Lambda l@[LimeNode (Symbol a) _ _] r@(LimeNode _ _ _) -> do
         tv <- freshTVar
 
-        let env' = Map.insert a (Forall [] tv) env
+        let env' = (fst env, Map.insert a (Forall [] tv) $ snd env)
         (s1, r'@(LimeNode _ _ t1)) <- typecheck env' r
         
         pure (s1, n { expr = Lambda l r', info = apply s1 (TLambda tv t1) })
@@ -533,42 +555,50 @@ typecheck env n@(LimeNode node npos _) = case node of
     _ -> throwError (npos, TEUnsupportedExpr n)
 
 topLevelTypecheck :: TypeEnv -> LimeNode -> Typechecker (TypeEnv, LimeNode)
-topLevelTypecheck env n@(LimeNode expr pos _) = case expr of
+topLevelTypecheck env@(tenv, venv) n@(LimeNode expr pos _) = case expr of
     Infix AssignType l@(LimeNode (Symbol s) _ _) r -> do
         rt <- typeLevelEval env r
         curTVar .= 0
-        pure $ (Map.insert s rt env, n)
+        pure $ ((tenv, Map.insert s rt venv), n)
     Infix AssignValue a@(LimeNode (Symbol s) _ _) b -> do
         (s1, b') <- typecheck env b
         let env'  = applyEnv s1 env
             t'    = generalize env' $ getType b'
-        env'' <- case env !? s of
+        env'' <- case tenv !? s of
             Just x -> unify pos (schemeType x) (schemeType t') *> pure env
-            Nothing -> pure $ Map.insert s t' env
+            Nothing -> pure $ (tenv, Map.insert s t' venv)
         curTVar .= 0
         pure $ (env'', n { expr = Infix AssignValue a b', info = getType b' })
-    Data name ms ->
-        let t = TADT name ms
-            env' = Map.insert name (Forall [] t) env
-            env'' = foldl' (\b a -> Map.insert a (Forall [] t) b) env' ms
-        in pure $ (env'', n { info = t })
+    Data name ms -> do
+        ms' <- mapM (\(a, b) -> mapM (\x -> schemeType <$> typeLevelEval env x) b >>= pure . (a,)) ms
+        let t = TADT name ms'
+            env' = (Map.insert name (Forall [] t) tenv, venv)
+            env'' = foldl' (\b (a, _) -> (fst b, Map.insert a (Forall [] t) $ snd b)) env' ms
+        pure $ (env'', n { info = t })
     _ -> (\(_, b) -> (env, b)) <$> typecheck env n
 
 infixType :: LimeType -> LimeType
 infixType t = TLambda t $ TLambda t t
 
 defInt :: LimeType
-defInt = TPrim $ PInt 4 True "Int"
+defInt = TNamed "Int" $ TPrim $ PInt 4 True
 
-defaultTypes :: TypeEnv
-defaultTypes = Map.fromList 
-    [ ("Int", Forall [] $ TPrim $ PInt 4 True "Int"),
-      ("Float", Forall [] $ TPrim $ PFloat 4 "Float"),
-      ("__add", Forall [] $ infixType defInt),
+defaultTypes :: [(Text, Scheme)]
+defaultTypes = 
+    [ ("Int", Forall [] $ TNamed "Int" $ TPrim $ PInt 4 True),
+      ("Float", Forall [] $ TNamed "Float" $ TPrim $ PFloat 4)
+    ]
+
+defaultValues :: [(Text, Scheme)]
+defaultValues =
+    [ ("__add", Forall [] $ infixType defInt),
       ("__sub", Forall [] $ infixType defInt),
       ("__mul", Forall [] $ infixType defInt),
       ("__div", Forall [] $ infixType defInt)
     ]
+
+defaultTypeEnv :: TypeEnv
+defaultTypeEnv = (Map.fromList defaultTypes, Map.fromList defaultValues)
 
 typecheckAllI :: [LimeNode] -> TypeEnv -> Typechecker (TypeEnv, [LimeNode])
 typecheckAllI [] env = pure (env, [])
@@ -578,7 +608,7 @@ typecheckAllI (n:ns) env = do
     pure $ (env'', n':n2)
 
 typecheckAll :: [LimeNode] -> Typechecker (TypeEnv, [LimeNode])
-typecheckAll ns = typecheckAllI ns defaultTypes
+typecheckAll ns = typecheckAllI ns defaultTypeEnv
 
 printPos :: Pos -> Text -> TypecheckError -> IO ()
 printPos (SourcePos sf sln scn, SourcePos ef eln ecn) text msg = do
@@ -598,6 +628,7 @@ printPos (SourcePos sf sln scn, SourcePos ef eln ecn) text msg = do
         TEInfiniteType -> putStrLn "infinite type"
         TEMismatch t1 t2 -> T.putStrLn $ "type mismatch: " <> printType t1 <> " and " <> printType t2
         TEVarNotFound n -> T.putStrLn $ "variable not found: " <> n
+        TETypeNotFound n -> T.putStrLn $ "type not found: " <> n
         TEUnsupportedExpr n -> putStrLn $ "unsupported expr: " <> show n
         TEUnsupportedPMExpr n -> putStrLn $ "unsupported pattern matched expr: " <> show n
         TEUnsupportedTLExpr n -> putStrLn $ "unsupported type level expr: " <> show n 
@@ -607,31 +638,32 @@ printTypeGo = \case
     TLambda a r -> "func (" <> printTypeGo a <> ") " <> printTypeGo r
     TVar i -> "p" <> T.pack (show i)
     TPrim p -> case p of
-        PFloat _ _ -> "float"
-        PInt _ _ _ -> "int"
+        PFloat _ -> "float"
+        PInt _ _ -> "int"
     TADT _ _ -> "int"
+    TNamed _ t -> printTypeGo t
     Unchecked -> "Unchecked"
 
-goBackend :: LimeNode -> Text
-goBackend n@(LimeNode node pos info) = case node of
-    Data _ ms -> fst $ foldl' f ("", 0) ms
-        where f (b, c) a = (b <> "var " <> a <> " = " <> T.pack (show c) <> "\n", c+1)
-    Infix AssignType _ _ -> ""
-    Infix AssignValue (LimeNode (Symbol "main") _ _) r -> "func main () {\n    fmt.Println(" <> goBackend r <> ")\n}"
-    Infix AssignValue l r -> "var " <> goBackend l <> " = " <> goBackend r
-    Lambda [ln@(LimeNode (Symbol a) _ _)] r -> "func (" <> a <> " " <> printTypeGo arg <> ") " <> printTypeGo ret <> " {\n" <> "    return " <> goBackend r <> "\n}"
-        where (TLambda arg ret) = info
-    FunCall f a -> goBackend f <> "(" <> goBackend a <> ")"
-    Int v -> T.pack $ show v
-    Symbol s -> s
-    Case v cs -> "switch " <> goBackend v <> "{" <> foldl' (\b (al, ar) -> b <> "\ncase " <> goBackend al <> ":\n\t" <> goBackend ar) "" cs <> "\n}"
-    -- catch all so the darn language server doesn't complain
-    _ -> "" --throwError (pos, "unsupported expression " <> show n)
+-- goBackend :: LimeNode -> Text
+-- goBackend n@(LimeNode node pos info) = case node of
+--     Data _ ms -> fst $ foldl' f ("", 0) ms
+--         where f (b, c) a = (b <> "var " <> a <> " = " <> T.pack (show c) <> "\n", c+1)
+--     Infix AssignType _ _ -> ""
+--     Infix AssignValue (LimeNode (Symbol "main") _ _) r -> "func main () {\n    fmt.Println(" <> goBackend r <> ")\n}"
+--     Infix AssignValue l r -> "var " <> goBackend l <> " = " <> goBackend r
+--     Lambda [ln@(LimeNode (Symbol a) _ _)] r -> "func (" <> a <> " " <> printTypeGo arg <> ") " <> printTypeGo ret <> " {\n" <> "    return " <> goBackend r <> "\n}"
+--         where (TLambda arg ret) = info
+--     FunCall f a -> goBackend f <> "(" <> goBackend a <> ")"
+--     Int v -> T.pack $ show v
+--     Symbol s -> s
+--     Case v cs -> "switch " <> goBackend v <> "{" <> foldl' (\b (al, ar) -> b <> "\ncase " <> goBackend al <> ":\n\t" <> goBackend ar) "" cs <> "\n}"
+--     -- catch all so the darn language server doesn't complain
+--     _ -> "" --throwError (pos, "unsupported expression " <> show n)
 
 -- printScheme :: Scheme -> Text
 -- printScheme (Forall vs t) = foldl' (\b a -> b <> (T.pack $ show a) <> " ") "" vs <> "=> " <> printType t
 
-printTypeEnv :: TypeEnv -> Text
+printTypeEnv :: Map Text Scheme -> Text
 printTypeEnv env = foldl' (\b (n, t) -> b <> n <> " :: " <> printType (schemeType t) <> "\n") "" $ Map.toList env
 
 main :: IO ()
@@ -653,8 +685,9 @@ main = do
                     printPos pos test msg
                     putStr "\n"
                 Right (env, ns) -> do
-                    T.putStrLn $ printTypeEnv env
-                    case env !? "main" of
+                    T.putStrLn $ printTypeEnv $ fst env
+                    T.putStrLn $ printTypeEnv $ snd env
+                    case snd env !? "main" of
                         Nothing -> putStrLn "ERROR: no main function found"
                         Just m -> do
                             pure ()
