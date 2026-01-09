@@ -78,6 +78,7 @@ executable lime
         , text
         , containers
         , process
+        , vector
 
     -- Directories containing source files.
     hs-source-dirs:   app

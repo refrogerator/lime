@@ -5,27 +5,27 @@ module Main where
 
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
-import qualified Text.Megaparsec
 import qualified Control.Monad.Combinators.Expr as E 
-import qualified Data.List
 import qualified Data.Set as Set
 import qualified Data.Map.Strict as Map
 import qualified Text.Megaparsec.Char.Lexer as L
-import System.Process hiding (env)
 import Data.Text (Text)
 import Text.Megaparsec hiding (State, Pos, empty)
 import Text.Megaparsec.Char
 import Text.Megaparsec.Debug
-import Data.Maybe
 import Data.Map.Strict (Map, (!?))
 import Data.Void (Void)
 import Data.Functor
 import Data.Foldable
-import Data.Traversable
 import Control.Monad.State
 import Control.Monad.Except
 import Lens.Micro.Platform hiding (at)
 import Control.Monad.Identity
+import Data.Char (isUpperCase)
+import System.Process (callCommand)
+import System.Exit (exitFailure)
+import Debug.Trace (trace)
+import qualified Data.Text.Internal.Fusion.Size as T
 
 -- not sure if ISInvalid is even needed
 data IndentationState = ISUnset Int | ISSet Int | ISInvalid deriving Show
@@ -61,6 +61,7 @@ data LimeExpr =
     | Data Text [(Text, [LimeNode])]
     -- value cases
     | Case LimeNode [(LimeNode, LimeNode)]
+    | Discard
     -- | DoBlock [LimeNode]
     deriving Show
 
@@ -133,7 +134,6 @@ caseBlock :: Parser [(LimeNode, LimeNode)]
 caseBlock = (some (p <* lexeme eol))
     where p = do
             -- l <- dbg "node" limeNode
-            il <- unPos <$> L.indentLevel
             l <- limeNode
             indentBracket $ do
                 _ <- symbol "->"
@@ -142,7 +142,6 @@ caseBlock = (some (p <* lexeme eol))
 
 limeCase :: Parser LimeExpr
 limeCase = do
-    l <- unPos <$> L.indentLevel
     _ <- symbol "case"
     v <- dbg "node" limeNode
     indentBracket $ do
@@ -169,6 +168,9 @@ limeTermToNode p = do
 nodesToInfix :: LimeOp -> LimeNode -> LimeNode -> LimeNode
 nodesToInfix op l@(LimeNode _ (start, _) _) r@(LimeNode _ (_, end) _) = LimeNode (Infix op l r) (start, end) Unchecked
 
+limeParen :: Parser LimeNode
+limeParen = between (symbol "(") (symbol ")") limeNode
+
 limeExprToNode :: Parser (LimeNode -> LimeNode -> LimeExpr) -> Parser (LimeNode -> LimeNode -> LimeNode)
 limeExprToNode p = do
     r <- p
@@ -177,10 +179,13 @@ limeExprToNode p = do
 keyword :: Parser ()
 keyword = void $ choice ["of"]
 
+limeDiscard :: Parser LimeExpr
+limeDiscard = Discard <$ symbol "_"
+
 limeTerm :: Parser LimeNode
-limeTerm = limeTermToNode $ do
+limeTerm = do
     notFollowedBy keyword
-    choice [limeCase, limeInt, lexeme limeLambda, lexeme limeLet, limeSymbol] 
+    limeParen <|> (limeTermToNode $ choice [limeCase, limeDiscard, limeInt, lexeme limeLambda, lexeme limeLet, limeSymbol])
 
 limeTopLevelNode :: Parser LimeNode
 limeTopLevelNode = limeTermToNode $ choice [limeData] 
@@ -222,12 +227,12 @@ limeNode = E.makeExprParser limeTerm table
         table = 
           [ [ binary' "" FunCall
             ]
-          , [ binaryF "+" Add
-            , binaryF' "-" Sub
-            ] 
           , [ binaryF "*" Mul
             , binaryF "/" Div
             ]
+          , [ binaryF "+" Add
+            , binaryF' "-" Sub
+            ] 
           ]
         binary s op = E.InfixL $ limeExprToNode (Infix op <$ symbol s)
         -- parse ops like a + b as function calls
@@ -252,6 +257,7 @@ simplifyPatternMatch lhsn@(LimeNode lhs _ _) rhs@(LimeNode _ rpos _) = case lhs 
     FunCall l@(LimeNode (Symbol _) _ _) r@(LimeNode (Symbol _) _ _) -> (l, newNode (Lambda [r] rhs) rpos)
     FunCall l r@(LimeNode (Symbol _) _ _) -> simplifyPatternMatch l $ newNode (Lambda [r] rhs) rpos
     Symbol _ -> (lhsn, rhs)
+    _ -> error "pattern match case not handled in simplification pass"
 
 infixToFun :: Text -> LimeNode -> LimeNode -> Pos -> LimeNode
 infixToFun name l r pos = newNode (FunCall (newNode (FunCall (newNode (Symbol name) pos) $ simplifyLime l) pos) $ simplifyLime r) pos
@@ -286,6 +292,7 @@ simplifyLime n@(LimeNode node pos _) = case node of
         n { expr = Let (simplifyLime l) (simplifyLime r) }
     Data _ _ -> n
     Case _ _ -> n
+    Discard -> n
 
 printNode :: LimeNode -> Text
 printNode n@(LimeNode node _ _) = case node of
@@ -307,22 +314,13 @@ printNode n@(LimeNode node _ _) = case node of
     Bool b -> T.pack $ show b
     String s -> s
     List s -> "[" <> foldl' (\b a -> b <> printNode a <> " ") "" s <> "]"
-    Data n ns -> "data " <> n <> " = " <> T.intercalate " | " (map (\(a, b) -> a <> " " <> (T.intercalate " " (map printNode b))) ns)
+    Data n ns -> "data " <> n <> " = " <> T.intercalate " | " (map (\(a, b) -> a <> (T.intercalate " " (map printNode b))) ns)
     Case v cs -> "case " <> printNode v <> " of\n    " <> (T.intercalate "\n    " $ map (\(l, r) -> printNode l <> " -> " <> printNode r) cs)
     Prefix op r ->
         ""
     Let l r ->
         ""
-
-data Value =
-    VFloat Float
-    | VBool Bool
-    | VString Text
-    | VSymbol Text
-    | VList [LimeNode]
-    | VFunc LimeNode
-    | VNone
-    deriving (Show)
+    Discard -> "_"
 
 data LimePrim
     -- size, signedness, name
@@ -345,12 +343,15 @@ data LimeType =
 
 printType :: LimeType -> Text
 printType = \case
-    TLambda a r -> "(" <> printType a <> " -> " <> printType r <> ")"
+    TLambda a r -> 
+        case a of
+            TLambda _ _ -> "(" <> printType a <> " -> " <> printType r <> ")"
+            _ -> printType a <> " -> " <> printType r
     TPrim p -> case p of
         PInt _ _ -> "Int" 
         PFloat _ -> "Float"
     TVar i -> "p" <> T.pack (show i)
-    TADT n _ -> n
+    TADT n ms -> n <> " (" <> T.intercalate " | " (map (\(n', ts) -> n' <> if null ts then "" else " " <> T.intercalate " " (map printType ts)) ms) <> ")"
     TNamed t _ -> t
     Unchecked -> "Unchecked"
 
@@ -378,6 +379,7 @@ data TypecheckError
     | TEUnsupportedExpr LimeNode
     | TEUnsupportedPMExpr LimeNode
     | TEUnsupportedTLExpr LimeNode
+    | TENonFN
     deriving Show
 
 type Typechecker a = ExceptT (Pos, TypecheckError) (State TypecheckerState) a
@@ -412,9 +414,11 @@ findTypeError env n pos = findTypeEnv env n >>= \case
 
 typeLevelEval :: TypeEnv -> LimeNode -> Typechecker Scheme
 typeLevelEval env@(tenv, _) n@(LimeNode node pos _) = case node of
-    Symbol s -> case tenv !? s of
-        Just a -> pure a
-        Nothing -> throwError (pos, TETypeNotFound s)
+    Symbol s -> if isUpperCase $ T.head s 
+        then case tenv !? s of
+            Just a -> pure a
+            Nothing -> throwError (pos, TETypeNotFound s)
+        else freshTVar >>= \(TVar v) -> pure $ Forall [v] $ TVar v
     Infix FunArrow l r -> do
         (Forall lvs lt) <- typeLevelEval env l
         (Forall rvs rt) <- typeLevelEval env r
@@ -501,11 +505,24 @@ generalize :: TypeEnv -> LimeType -> Scheme
 generalize env t = Forall as t
     where as = Set.toList $ freeTypeVars t `Set.difference` freeTypeVarsEnv env
 
-typecheckPatternMatch :: TypeEnv -> LimeNode -> Typechecker (Subst, LimeNode)
+typecheckPatternMatch :: TypeEnv -> LimeNode -> Typechecker (TypeEnv, LimeNode)
 typecheckPatternMatch env n@(LimeNode node npos _) = case node of
-    Int _ -> pure $ (Map.empty, n { info = defInt })
+    Int _ -> pure $ (env, n { info = defInt })
     Symbol s -> 
-        (\v -> (Map.empty, n { info = v })) <$> findVarError env s npos
+        (\v -> (env, n { info = v })) <$> findVarError env s npos
+    FunCall f (LimeNode a _ _) -> do
+        (env'@(tenv, venv), f') <- typecheckPatternMatch env f 
+        case info f' of
+            TLambda arg ret ->
+                case a of
+                    Symbol s ->
+                        pure ((tenv, Map.insert s (Forall [] arg) venv), n { info = ret })
+                    Discard ->
+                        pure (env', n { info = ret })
+                    _ -> throwError (npos, TEUnsupportedPMExpr n)
+            _ -> throwError (npos, TENonFN)
+
+            -- Nothing -> pure $ (tenv, Map.insert s t' venv)
     _ -> throwError (npos, TEUnsupportedPMExpr n)
 
 
@@ -513,13 +530,13 @@ typecheck :: TypeEnv -> LimeNode -> Typechecker (Subst, LimeNode)
 typecheck env n@(LimeNode node npos _) = case node of
     Symbol s -> do
         (\v -> (Map.empty, n { info = v })) <$> findVarError env s npos
-    Lambda l@[LimeNode (Symbol a) _ _] r@(LimeNode _ _ _) -> do
+    Lambda [l@(LimeNode (Symbol a) _ _)] r@(LimeNode _ _ _) -> do
         tv <- freshTVar
 
         let env' = (fst env, Map.insert a (Forall [] tv) $ snd env)
         (s1, r'@(LimeNode _ _ t1)) <- typecheck env' r
         
-        pure (s1, n { expr = Lambda l r', info = apply s1 (TLambda tv t1) })
+        pure (s1, n { expr = Lambda [l { info = (apply s1 tv) }] r', info = apply s1 (TLambda tv t1) })
     FunCall f a -> do
         tv <- freshTVar
         (s1, f') <- typecheck env f
@@ -535,8 +552,8 @@ typecheck env n@(LimeNode node npos _) = case node of
 
         let check b (l, r) = do
                 ((so, env), cs') <- b
-                (s1, r') <- typecheck env r
-                (s2, l') <- typecheckPatternMatch env l
+                (env', l') <- typecheckPatternMatch env l
+                (s2, r') <- typecheck env' r
                 s3 <- unify (pos l) (info v') (info l')
                 sn <- case cs' of
                         (c:_) -> do
@@ -545,10 +562,12 @@ typecheck env n@(LimeNode node npos _) = case node of
                             s5 <- unify (pos l) (info $ fst c) (info l')
                             pure $ Map.unions [s1, s2, s3, s4, s5]
                         [] -> pure $ Map.union s1 s2
-                let env' = applyEnv sn env
-                pure ((Map.union so sn, env'), (l', r'):cs')
+                let env'' = applyEnv sn env'
+                pure ((Map.union so sn, env''), (l', r'):cs')
         ((s2, env''), cs') <- foldl' check (pure ((s1, env'), [])) cs
-        pure $ (s2, n { expr = Case v' cs', info = info $ snd $ head cs'})
+        -- this is crucial so that the type of v' can be determined
+        let v'' = v' { info = apply s2 $ info v' }
+        pure $ (s2, n { expr = Case v'' cs', info = info $ snd $ head cs'})
     Int _ -> pure $ (Map.empty, n { info = defInt })
 
     -- catch all so the darn language server doesn't complain
@@ -573,7 +592,7 @@ topLevelTypecheck env@(tenv, venv) n@(LimeNode expr pos _) = case expr of
         ms' <- mapM (\(a, b) -> mapM (\x -> schemeType <$> typeLevelEval env x) b >>= pure . (a,)) ms
         let t = TADT name ms'
             env' = (Map.insert name (Forall [] t) tenv, venv)
-            env'' = foldl' (\b (a, _) -> (fst b, Map.insert a (Forall [] t) $ snd b)) env' ms
+            env'' = foldl' (\b (a, cs) -> (fst b, Map.insert a (Forall [] (foldl' (\t ti -> TLambda ti t) t $ reverse cs)) $ snd b)) env' ms'
         pure $ (env'', n { info = t })
     _ -> (\(_, b) -> (env, b)) <$> typecheck env n
 
@@ -632,6 +651,7 @@ printPos (SourcePos sf sln scn, SourcePos ef eln ecn) text msg = do
         TEUnsupportedExpr n -> putStrLn $ "unsupported expr: " <> show n
         TEUnsupportedPMExpr n -> putStrLn $ "unsupported pattern matched expr: " <> show n
         TEUnsupportedTLExpr n -> putStrLn $ "unsupported type level expr: " <> show n 
+        TENonFN -> putStrLn "can't apply non-function"
 
 printTypeGo :: LimeType -> Text
 printTypeGo = \case
@@ -640,60 +660,381 @@ printTypeGo = \case
     TPrim p -> case p of
         PFloat _ -> "float"
         PInt _ _ -> "int"
-    TADT _ _ -> "int"
+    TADT _ _ -> "ADT"
     TNamed _ t -> printTypeGo t
     Unchecked -> "Unchecked"
 
--- goBackend :: LimeNode -> Text
--- goBackend n@(LimeNode node pos info) = case node of
---     Data _ ms -> fst $ foldl' f ("", 0) ms
---         where f (b, c) a = (b <> "var " <> a <> " = " <> T.pack (show c) <> "\n", c+1)
---     Infix AssignType _ _ -> ""
---     Infix AssignValue (LimeNode (Symbol "main") _ _) r -> "func main () {\n    fmt.Println(" <> goBackend r <> ")\n}"
---     Infix AssignValue l r -> "var " <> goBackend l <> " = " <> goBackend r
---     Lambda [ln@(LimeNode (Symbol a) _ _)] r -> "func (" <> a <> " " <> printTypeGo arg <> ") " <> printTypeGo ret <> " {\n" <> "    return " <> goBackend r <> "\n}"
---         where (TLambda arg ret) = info
---     FunCall f a -> goBackend f <> "(" <> goBackend a <> ")"
---     Int v -> T.pack $ show v
---     Symbol s -> s
---     Case v cs -> "switch " <> goBackend v <> "{" <> foldl' (\b (al, ar) -> b <> "\ncase " <> goBackend al <> ":\n\t" <> goBackend ar) "" cs <> "\n}"
---     -- catch all so the darn language server doesn't complain
---     _ -> "" --throwError (pos, "unsupported expression " <> show n)
+data GBackendState = GBackendState
+    { ctr :: Int
+    , bubble :: Text
+    }
 
--- printScheme :: Scheme -> Text
--- printScheme (Forall vs t) = foldl' (\b a -> b <> (T.pack $ show a) <> " ") "" vs <> "=> " <> printType t
+type GBackend = State GBackendState
+
+getTempVar :: GBackend Int
+getTempVar = do
+    v <- get
+    put $ v { ctr = ctr v + 1 }
+    pure $ ctr v
+
+addBubble :: Text -> GBackend ()
+addBubble t = modify (\s -> s { bubble = bubble s <> "\n" <> t })
+
+popBubble :: GBackend Text
+popBubble = gets bubble <* modify (\s -> s { bubble = "" })
+
+-- goBackend :: LimeNode -> GBackend Text
+-- goBackend n@(LimeNode node pos ninfo) = case node of
+--     Data _ _ -> pure $ fst $ foldl' f ("", 0) ms
+--         where f (b, c) a = (b <> "var _cni" <> fst a <> " = " <> T.pack (show c) <> "\n" <> goGenerateConstructor a <> "\n", c+1)
+--               (TADT _ ms) = ninfo
+--     Infix AssignType _ _ -> pure ""
+--     Infix AssignValue (LimeNode (Symbol "main") _ _) r -> do
+--         r' <- goBackend r
+--         pure $ "func main () {\n    fmt.Println(" <> r' <> ")\n}"
+--     Infix AssignValue l r -> do
+--         l' <- goBackend l
+--         r' <- goBackend r
+--         pure $ "var " <> l' <> " = " <> r'
+--     Lambda [ln@(LimeNode (Symbol a) _ arg)] r@(LimeNode _ _ ret)  -> do
+--         s <- get
+--         r' <- goBackend r
+--         -- b <- bubble <$> get
+--         b <- popBubble
+--         -- restore bubble
+--         modify (\s' -> s' { bubble = bubble s })
+--         pure $ "func (" <> a <> " " <> printTypeGo arg <> ") " <> printTypeGo ret <> " {\n" <> b <> "\n    return " <> r' <> "\n}"
+--     FunCall f a -> do
+--         f' <- goBackend f 
+--         a' <- goBackend a
+--         pure $ f' <> "(" <> a' <> ")"
+--     Int v -> pure $ T.pack $ show v
+--     Symbol s -> if isUpperCase $ T.head s then pure $ "_cnv" <> s else pure s
+--     Case v cs -> do
+--         tv <- (("_tv" <>) . T.pack . show) <$> getTempVar
+--         v' <- goBackend v
+--         let v'' = case info v of
+--                 TADT _ _ -> v' <> ".t"
+--                 _ -> v'
+--         r' <- foldl' (\b (al, ar) -> do
+--             b' <- b
+--             al' <- goPMBackend al
+--             ar' <- goBackend ar
+--             pure $ b' <> "\ncase " <> al' <> ":\n\t" <> tv <> " = " <> ar') (pure "") cs 
+--         -- let (TLambda _ ret) = info
+--         addBubble $ "var " <> tv <> " " <> printTypeGo ninfo <> "\n" <> "switch " <> v'' <> "{" <> r' <> "\n}"
+--         pure tv
+--     -- catch all so the darn language server doesn't complain
+--     _ -> pure "" --throwError (pos, "unsupported expression " <> show n)
 
 printTypeEnv :: Map Text Scheme -> Text
 printTypeEnv env = foldl' (\b (n, t) -> b <> n <> " :: " <> printType (schemeType t) <> "\n") "" $ Map.toList env
 
+type Counter = State Int
+
+data Value
+    = VInt Int
+    | VArray LimeType [Value]
+    | VFunc (Text, LimeType, LimeType) [Instruction]
+    | VConstructorIndex Text
+    deriving Show
+
+data Instruction
+    = IApply
+    | IConst Value
+    | IGetVal Text
+    | IGetFunc Int
+    | IDup
+    | IDrop
+    | IFlip
+    | ISwitch LimeType [(Value, [Instruction])]
+    | ISetVal Text
+    | IIndexADT Text Int
+    deriving Show
+
+data LinearizerState = LinearizerState
+    { _functions :: [([Instruction], LimeType)]
+    , _curFn :: Int
+    , _names :: [(Text, Int)]
+    , _types :: [LimeType]
+    }
+    deriving Show
+
+makeLenses ''LinearizerState
+
+addFunction :: [Instruction] -> LimeType -> Linearizer Int
+addFunction f t = do
+    i <- gets _curFn
+    curFn %= (+1)
+    functions %= ((f, t):)
+    pure i
+
+addTopLevelFunction :: Text -> [Instruction] -> LimeType -> Linearizer ()
+addTopLevelFunction n f t = do
+    i <- addFunction f t
+    names %= ((n, i):)
+
+type Linearizer = State LinearizerState
+
+goPMBackend :: LimeNode -> GBackend Text
+goPMBackend n@(LimeNode node pos ninfo) = case node of
+    Int v -> pure $ T.pack $ show v
+    Symbol s -> if isUpperCase $ T.head s then pure $ "_cni" <> s else pure s
+    FunCall f a -> goPMBackend f
+    _ -> pure ""
+
+linearizePMCase :: LimeNode -> (Value, [Instruction], (Text, Int))
+linearizePMCase (LimeNode node pos ninfo) = case node of
+    Int v -> (VInt v, [], ("", 0))
+    Symbol s -> (VConstructorIndex s, [], (s, 0))
+    FunCall f (LimeNode a _ _) -> let (v, is, (n, i)) = linearizePMCase f in case a of
+        Symbol s -> (v, is <> [IDup, IIndexADT n i, ISetVal s], (n, i+1))
+        Discard -> (v, is, (n, i+1))
+        _ -> error "unsupported match2"
+    _ -> error "unsupported match"
+
+linearize :: LimeNode -> Linearizer [Instruction]
+linearize n@(LimeNode node npos ninfo) = case node of
+    Symbol s -> pure [IGetVal s]
+    -- Lambda l@[LimeNode (Symbol a) _ _] r@(LimeNode _ _ _) -> do
+    FunCall f a -> do
+        a' <- linearize a
+        f' <- linearize f
+        pure $ a' <> f' <> [IApply]
+    Lambda [ln@(LimeNode (Symbol a) _ ainfo)] r@(LimeNode _ _ rinfo) -> do
+        r' <- linearize r 
+        pure [IConst $ VFunc (a, ainfo, rinfo) r']
+    Int v -> pure [IConst $ VInt v]
+    Case v@(LimeNode _ _ vinfo) cs -> do
+        v' <- linearize v
+        cs' <- traverse (\(l,r) -> do
+            r' <- linearize r
+            let (l', lr, _) = linearizePMCase l
+            pure (l', [IFlip] <> lr <> [IDrop] <> r')) cs
+        let adtStuff = case vinfo of
+                TADT _ _ -> [IDup, IGetVal "__adtType", IApply]
+                _ -> []
+        pure $ v' <> adtStuff <> [ISwitch ninfo cs']
+    _ -> error $ T.unpack $ printNode n
+
+    -- catch all so the darn language server doesn't complain
+    -- _ -> throwError (npos, TEUnsupportedExpr n)
+    
+
+linearizeTopLevel :: LimeNode -> Linearizer ()
+linearizeTopLevel n@(LimeNode node npos ninfo) = case node of
+    -- Infix AssignType l@(LimeNode (Symbol s) _ _) r -> do
+    Infix AssignValue (LimeNode (Symbol s) _ _) b -> do
+        b' <- linearize b
+        addTopLevelFunction s b' ninfo
+    -- Data name ms -> do
+    _ -> pure ()
+
+data CBackendData = CBackendData
+    { _stack :: [Int]
+    , _counter :: Int
+    }
+    deriving Show
+
+makeLenses ''CBackendData
+
+type CBackend = State CBackendData
+
+toCVar :: Int -> Text
+toCVar i = "_" <> T.pack (show i)
+
+popStack :: CBackend Text
+popStack = do
+    s <- gets $ head . _stack
+    stack %= tail
+    pure $ toCVar s
+
+peekStack :: CBackend Text
+peekStack = gets $ toCVar . head . _stack
+
+pushStack :: CBackend Text
+pushStack = do
+    c <- gets _counter
+    counter %= (+1)
+    stack %= (c:)
+    pure $ toCVar c
+
+valueToGo :: Value -> CBackend Text
+valueToGo v = case v of
+    VInt i -> pure $ T.pack (show i)
+    VArray t v -> do
+        v' <- (T.intercalate ", " <$> (traverse valueToGo v))
+        pure $ "[]" <> printTypeGo t <> "{" <> v'
+    VFunc (n, t, ret) is -> do
+        is' <- (T.intercalate "\n    " <$> (traverse linearizedToC is))
+        r' <- popStack
+        pure $ "func (" <> n <> " " <> printTypeGo t <> ") " <> printTypeGo ret <> " {\n    " <> is' <> "\n    return " <> r' <> "\n    }"
+    VConstructorIndex t -> do
+        pure $ "_cni" <> t
+
+linearizedToC :: Instruction -> CBackend Text
+linearizedToC = \case
+    IApply -> do
+        f <- popStack
+        a <- popStack
+        r <- pushStack
+        pure $ r <> " := " <> f <> "(" <> a <> ")"
+    IConst v -> do
+        r <- pushStack
+        v' <- valueToGo v
+        pure $ r <> " := " <> v'
+    IGetVal v -> do
+        r <- pushStack
+        pure $ r <> " := " <> if isUpperCase $ T.head v then "_cnv" <> v else v
+    IDup -> do
+        v <- gets $ head . _stack
+        stack %= (v:)
+        pure ""
+    IDrop -> do
+        _ <- popStack
+        pure $ ""
+    IFlip -> do
+        stack %= (\(a:b:cs) -> (b:a:cs))
+        pure ""
+    IGetFunc i -> do
+        r <- pushStack
+        pure $ r <> " := _fn" <> T.pack (show i)
+    ISwitch t cs -> do
+        v <- popStack
+        ret <- pushStack
+        let f (l, r) = do
+                s <- gets _stack
+
+                l' <- valueToGo l
+                r' <- T.intercalate "\n    " <$> (traverse linearizedToC r)
+                final <- popStack
+
+                stack .= s
+                pure $ "    case " <> l' <> ":\n    " <> r' <> "\n    " <>
+                    ret <> " = " <> final
+        cs' <- T.intercalate "\n" <$> traverse f cs
+        -- drop ADT value
+        stack %= (\(a:_:cs) -> (a:cs))
+        pure $ "var " <> ret <> " " <> printTypeGo t <> "\n    switch (" <> v <> ") {\n" <> cs' <> "\n    }"
+    ISetVal s -> do
+        v <- popStack
+        pure $ s <> " := " <> v
+    IIndexADT n i -> do
+        v <- popStack
+        r <- pushStack
+        pure $ r <> " := " <> v <> ".v.(_cns" <> n <> ")._" <> T.pack (show i)
+
+functionToC :: Int -> [Instruction] -> LimeType -> Text
+functionToC name is t = evalState f (CBackendData [] 0) 
+    where f = do
+            let header = "func _fn" <> T.pack (show name) <> "() " <> printTypeGo t <> " {\n    "
+            v <- T.intercalate "\n    " <$> (traverse linearizedToC is)
+            r <- popStack
+            pure $ header <> v <> "\n    return " <> r <> ";\n}"
+
+goGenerateConstructor :: (Text, [LimeType]) -> Text
+goGenerateConstructor (name, ts) = if null ts then cnvDef <> "ADT{" <> cniName <> ",nil}"
+    else "type _cns" <> name <> " struct {\n    " <> T.intercalate "\n    " (zipWith (\a b -> "_" <> (T.pack $ show b) <> " " <> printTypeGo a) ts [0..]) <> "\n}\n"
+        <> cnvDef <> recvCnv ts ("ADT{" <> cniName <> "," <> cnsName <> "{" <> T.intercalate "," (zipWith (\_ b -> "_" <> T.pack (show b)) ts [0..]) <> "}" <> "}") 0
+    where cnvDef = "var _cnv" <> name <> " = "
+          cnsName = "_cns" <> name
+          cniName = "_cni" <> name
+          recvCnv [t] s i = "func (_" <> T.pack (show i) <> " " <> printTypeGo t <> ") ADT {\n    return " <> s <> "}"
+          recvCnv tsf@(t:ts) s i = "func (_" <> T.pack (show i) <> " " <> printTypeGo t <> ") " <> printTypeGo (recvCnvType ts) <> " {\n    return " <> recvCnv ts s (i+1) <> "}"
+          recvCnv [] s _ = s
+          recvCnvType :: [LimeType] -> LimeType
+          recvCnvType [t] = TLambda t $ TADT "" []
+          recvCnvType (t:ts) = TLambda t $ recvCnvType ts
+          recvCnvType [] = Unchecked
+
+typeToGo :: Scheme -> Text
+typeToGo (Forall _ t) = case t of
+    TADT _ ms -> (fst $ foldl' f ("", 0) ms) <> "\n"
+        where f (b, c) a = (b <> "var _cni" <> fst a <> " = " <> T.pack (show c) <> "\n" <> goGenerateConstructor a <> "\n", c+1)
+    _ -> ""
+
+parseLime :: String -> Text -> IO [LimeNode]
+parseLime filename contents = let (Identity (parsed, s)) = runStateT (runParserT program filename contents) $ ISUnset 1
+    in case parsed of
+        Right p -> pure p
+        Left e -> do
+            putStrLn $ errorBundlePretty e 
+            print s
+            exitFailure
+
+typecheckLime :: [LimeNode] -> Text -> IO (TypeEnv, [LimeNode])
+typecheckLime ns fileContents = let Identity (r, _) = runStateT (runExceptT $ typecheckAll ns) (TypecheckerState 0)
+    in case r of
+        Left (pos, msg) -> do
+            printPos pos fileContents msg
+            putStr "\n"
+            exitFailure
+        Right res -> pure res
+
+printValue :: Int -> Value -> Text
+printValue i v = case v of
+    VInt i -> "VInt " <> T.pack (show i)
+    VArray _ a -> "Varray [" <> T.intercalate ", " (map (printValue 0) a) <> "]"
+    VFunc (n,_,_) is -> "VFunc " <> n <> "\n" <> (T.intercalate "\n" $ map (printInstruction (i+4)) is)
+    VConstructorIndex t -> "VConstructorIndex " <> t
+
+printInstruction :: Int -> Instruction -> Text
+printInstruction i inst = T.replicate i " " <> case inst of
+    IApply -> "IApply"
+    IConst v -> "IConst " <> printValue i v
+    IGetVal v -> "IGetVal " <> v
+    IDup -> "IDup"
+    IDrop -> "IDrop"
+    IFlip -> "IFlip"
+    IGetFunc f -> "IGetFunc" <> T.pack (show f)
+    ISwitch _ cs -> "ISwitch\n" <> T.intercalate "\n" (map (\(l, r) -> T.replicate (i+4) " " <> printValue 0 l <> "\n" <> printInstructions (i+8) r) cs)
+    ISetVal t -> "ISetVal " <> t
+    IIndexADT n idx -> "IIndexADT " <> n <> " " <> T.pack (show idx)
+    
+printInstructions :: Int -> [Instruction] -> Text
+printInstructions i v = T.intercalate "\n" $ map (printInstruction i) v
+
 main :: IO ()
 main = do
     test <- T.readFile "test.lm"
-    let (Identity (parsed, s)) = runStateT (runParserT program "test.lm" test) $ ISUnset 1
-    -- let parsed = runParser program "test.lm" test
-    -- print parsed
-    case parsed of
-        Right p -> do
-            -- runStateT (runExceptT $ for_ p eval) (InterpreterState Data.Map.Strict.empty []) >>= print
-            -- print $ T.intercalate "\n" $ map toLisp p
-            let simplified = map simplifyLime p
-            traverse_ (T.putStrLn . printNode) p
-            putStrLn ""
-            let Identity (r, s) = runStateT (runExceptT $ typecheckAll simplified) (TypecheckerState 0)
-            case r of
-                Left (pos, msg) -> do
-                    printPos pos test msg
-                    putStr "\n"
-                Right (env, ns) -> do
-                    T.putStrLn $ printTypeEnv $ fst env
-                    T.putStrLn $ printTypeEnv $ snd env
-                    case snd env !? "main" of
-                        Nothing -> putStrLn "ERROR: no main function found"
-                        Just m -> do
-                            pure ()
-                            -- header <- T.readFile "header.go"
-                            -- T.writeFile "out.go" $ foldl' (\b a -> b <> goBackend a <> "\n") header ns
-                            -- callCommand "go run out.go"
-        Left e -> do
-            putStrLn $ errorBundlePretty e
-            print s
+    -- let test = "add a b = a + b\nmain = add 1 2\njoe = 1 + 3"
+    parsed <- parseLime "test.lm" test
+    let simplified = map simplifyLime parsed
+    traverse_ (T.putStrLn . printNode) simplified
+    putStrLn ""
+    (env, ns) <- typecheckLime simplified test
+    T.putStrLn $ printTypeEnv $ fst env
+    T.putStrLn $ printTypeEnv $ snd env
+    let (r, s) = runState (traverse linearizeTopLevel ns) (LinearizerState [] 0 [] [])
+    let newNames = map (\(a,b) -> if a == "main" then ("__lmmain",b) else (a,b)) $ _names s
+
+    T.putStrLn $ T.intercalate "\n\n" $ map (\(v,_) -> printInstructions 0 v) $ _functions s
+
+    header <- T.readFile "header.go"
+    T.writeFile "out.go" $ header <> "\n" <> 
+        (T.intercalate "" $ map typeToGo (Map.elems $ fst env)) <>
+        (T.intercalate "\n\n" $ map (\(a, (b, c)) -> functionToC a b c) (zip [0..] (_functions s))) <> "\n\n" <>
+        (T.intercalate "\n\n" $ map (\(a, b) -> "var " <> a <> " = _fn" <> T.pack (show (_curFn s - b - 1)) <> "()") $ newNames)
+        
+
+    putStrLn ""
+
+    callCommand "go run out.go"
+    -- case _functions s !? "main" of
+    --     Nothing -> putStrLn "ERROR: no main function found"
+    --     Just m -> 
+    --         case snd env !? "main" of
+    --             Nothing -> putStrLn "ERROR: no main function found"
+    --             Just t -> do
+    --                 header <- T.readFile "header.d"
+    --                 T.writeFile "out.d" $ header <> "\n" <> functionToC "_hsmain" m t
+    -- case snd env !? "main" of
+    --     Nothing -> putStrLn "ERROR: no main function found"
+    --     Just m -> do
+    --         pure ()
+    --         header <- T.readFile "header.go"
+    --         T.writeFile "out.go" $ evalState (foldl' (\b a -> do
+    --             b' <- b
+    --             a' <- goBackend a
+    --             pure $ b' <> a' <> "\n") (pure header) ns) (GBackendState 0 "")
+    --         callCommand "go run out.go"

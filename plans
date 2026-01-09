@@ -2,3 +2,5 @@
 - lists
 - data
 - adts with generics
+- renaming pass at the very start that interns everything
+- monomorphization pass after typechecking
