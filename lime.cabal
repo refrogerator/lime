@@ -55,6 +55,8 @@ common warnings
     ghc-options: -Wall
 
 executable lime
+    ghc-options: -optl-fuse-ld=mold
+    ld-options:  -fuse-ld=mold
     -- Import common warning flags.
     import:           warnings
 

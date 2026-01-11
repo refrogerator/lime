@@ -11,25 +11,25 @@ func main() {
 	fmt.Println(__lmmain)
 }
 
-func __add(a int) func (int) int {
+func ___add(a int) func (int) int {
 	return func (b int) int {
 		return a + b;
 	}
 }
 
-func __sub(a int) func (int) int {
+func ___sub(a int) func (int) int {
 	return func (b int) int {
 		return a - b;
 	}
 }
 
-func __mul(a int) func (int) int {
+func ___mul(a int) func (int) int {
 	return func (b int) int {
 		return a * b;
 	}
 }
 
-func __div(a int) func (int) int {
+func ___div(a int) func (int) int {
 	return func (b int) int {
 		return a / b;
 	}

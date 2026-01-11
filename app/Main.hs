@@ -206,12 +206,10 @@ limeTopLevel :: Parser LimeNode
 limeTopLevel = L.nonIndented scn $ (put $ ISSet 1) *> indentBracket (limeTopLevelNode <|> p)
     where p = do
             l <- limeNode
-            op <- choice $ lexeme <$>
-                [ AssignType <$ "::" 
-                , AssignValue <$ "=" ]
-            r <- case op of
-                AssignType -> typeLevelNode
-                AssignValue -> limeNode
+            (p2, op) <- choice $ lexeme <$>
+                [ (typeLevelNode, AssignType) <$ "::" 
+                , (limeNode, AssignValue) <$ "=" ]
+            r <- p2
             pure $ nodesToInfix op l r
 
 typeLevelNode :: Parser LimeNode
@@ -261,6 +259,13 @@ simplifyPatternMatch lhsn@(LimeNode lhs _ _) rhs@(LimeNode _ rpos _) = case lhs 
 
 infixToFun :: Text -> LimeNode -> LimeNode -> Pos -> LimeNode
 infixToFun name l r pos = newNode (FunCall (newNode (FunCall (newNode (Symbol name) pos) $ simplifyLime l) pos) $ simplifyLime r) pos
+
+-- for whenever i decide to change function calls to be uncurried
+-- simplifyFunCall :: LimeNode -> [LimeNode] -> (LimeNode, [LimeNode])
+-- simplifyFunCall f@(LimeNode node _ _) as = case node of
+--     FunCall f' [a'] -> simplifyFunCall f' ((simplifyLime a'):as)
+--     _ -> (simplifyLime f, as)
+
 
 simplifyLime :: LimeNode -> LimeNode
 simplifyLime n@(LimeNode node pos _) = case node of
@@ -812,7 +817,7 @@ linearize n@(LimeNode node npos ninfo) = case node of
             let (l', lr, _) = linearizePMCase l
             pure (l', [IFlip] <> lr <> [IDrop] <> r')) cs
         let adtStuff = case vinfo of
-                TADT _ _ -> [IDup, IGetVal "__adtType", IApply]
+                TADT _ _ -> [IDup, IGetVal "_adtType", IApply]
                 _ -> []
         pure $ v' <> adtStuff <> [ISwitch ninfo cs']
     _ -> error $ T.unpack $ printNode n
@@ -868,7 +873,7 @@ valueToGo v = case v of
     VFunc (n, t, ret) is -> do
         is' <- (T.intercalate "\n    " <$> (traverse linearizedToC is))
         r' <- popStack
-        pure $ "func (" <> n <> " " <> printTypeGo t <> ") " <> printTypeGo ret <> " {\n    " <> is' <> "\n    return " <> r' <> "\n    }"
+        pure $ "func (_" <> n <> " " <> printTypeGo t <> ") " <> printTypeGo ret <> " {\n    " <> is' <> "\n    return " <> r' <> "\n    }"
     VConstructorIndex t -> do
         pure $ "_cni" <> t
 
@@ -885,7 +890,7 @@ linearizedToC = \case
         pure $ r <> " := " <> v'
     IGetVal v -> do
         r <- pushStack
-        pure $ r <> " := " <> if isUpperCase $ T.head v then "_cnv" <> v else v
+        pure $ r <> " := " <> if isUpperCase $ T.head v then "_cnv" <> v else "_" <> v
     IDup -> do
         v <- gets $ head . _stack
         stack %= (v:)
@@ -918,7 +923,7 @@ linearizedToC = \case
         pure $ "var " <> ret <> " " <> printTypeGo t <> "\n    switch (" <> v <> ") {\n" <> cs' <> "\n    }"
     ISetVal s -> do
         v <- popStack
-        pure $ s <> " := " <> v
+        pure $ "_" <> s <> " := " <> v
     IIndexADT n i -> do
         v <- popStack
         r <- pushStack
@@ -952,6 +957,74 @@ typeToGo (Forall _ t) = case t of
     TADT _ ms -> (fst $ foldl' f ("", 0) ms) <> "\n"
         where f (b, c) a = (b <> "var _cni" <> fst a <> " = " <> T.pack (show c) <> "\n" <> goGenerateConstructor a <> "\n", c+1)
     _ -> ""
+
+data MonomorphizerState = MonomorphizerState
+    { _monomorphizedFns :: [(Maybe Text, LimeType, LimeNode)]
+    , _reqTypes :: [(Text, [LimeType])]
+    , _mFunctions :: (Map Text LimeNode)
+    }
+    deriving Show
+
+makeLenses ''MonomorphizerState
+
+type Monomorphizer = State MonomorphizerState
+
+monomorphizeFunCall :: LimeNode -> Map Int LimeType -> Monomorphizer (LimeNode, Maybe LimeNode, LimeType, Map Int LimeType)
+monomorphizeFunCall n@(LimeNode node _ ninfo) env = case node of
+    FunCall f a -> do
+        (f', n', ft, fnEnv) <- monomorphizeFunCall f env
+        a' <- monomorphize env a
+
+        let f la lr = pure $ (n { expr = FunCall f' a' }, n', lr, fnEnv')
+                where fnEnv' = case la of
+                        TVar v -> Map.insert v (apply env $ info a) fnEnv
+                        _ -> fnEnv
+
+        case ft of
+            TLambda la lr -> f la lr
+            _ -> f ft ft
+    Symbol s -> do
+        v <- gets _mFunctions
+        case v !? s of
+            -- not sure about this one
+            -- should probably apply
+            Just f -> monomorphize env n >>= \n' -> pure (n', Just f, info f, Map.empty)
+            Nothing -> error "could not find function in env"
+    _ -> monomorphize env n >>= \n' -> pure (n', Nothing, ninfo, Map.empty)
+
+monomorphize :: Map Int LimeType -> LimeNode -> Monomorphizer LimeNode
+monomorphize env n@(LimeNode node _ ninfo) = case node of
+    FunCall f a -> do
+        (n', r, _, fnEnv) <- monomorphizeFunCall n env
+        case r of
+            Just r' -> monomorphizeFnTL r' fnEnv
+            Nothing -> pure ()
+        pure $ n' { info = apply env ninfo }    
+    Symbol s -> pure $ n { info = apply env ninfo }
+    Lambda l r@(LimeNode _ _ rinfo) -> do
+        r' <- monomorphize env r
+        l' <- traverse (monomorphize env) l
+        pure $ n { expr = Lambda l' r', info = apply env ninfo }
+    Int v -> pure n
+
+monomorphizeFnTL :: LimeNode -> Map Int LimeType -> Monomorphizer ()
+monomorphizeFnTL n@(LimeNode node _ ninfo) env = case node of
+    Infix AssignValue l@(LimeNode (Symbol s) _ _) r -> do
+        r' <- monomorphize env r
+        monomorphizedFns %= ((Just s, apply env ninfo, n { expr = Infix AssignValue l r', info = apply env ninfo }):)
+
+collectNodeName :: LimeNode -> Maybe (Text, LimeNode)
+collectNodeName n@(LimeNode node _ _) = case node of
+    Infix AssignType (LimeNode (Symbol s) _ _) _ -> Just (s, n)
+    Infix AssignValue (LimeNode (Symbol s) _ _) _ -> Just (s, n)
+    Data name _ -> Just (name, n)
+    _ -> Nothing
+
+collectNodeNames :: [LimeNode] -> Map Text LimeNode
+collectNodeNames ns = foldl' f Map.empty ns
+    where f b n = case collectNodeName n of
+            Just (l, r) -> Map.insert l r b
+            Nothing -> b
 
 parseLime :: String -> Text -> IO [LimeNode]
 parseLime filename contents = let (Identity (parsed, s)) = runStateT (runParserT program filename contents) $ ISUnset 1
@@ -1003,23 +1076,37 @@ main = do
     traverse_ (T.putStrLn . printNode) simplified
     putStrLn ""
     (env, ns) <- typecheckLime simplified test
+
+    let mappedNodes = collectNodeNames ns
+
+    T.putStrLn $ T.intercalate "\n" $ fmap (\(a,b) -> a <> ": " <> printNode b) $ Map.toList $ mappedNodes
+
+
     T.putStrLn $ printTypeEnv $ fst env
     T.putStrLn $ printTypeEnv $ snd env
-    let (r, s) = runState (traverse linearizeTopLevel ns) (LinearizerState [] 0 [] [])
-    let newNames = map (\(a,b) -> if a == "main" then ("__lmmain",b) else (a,b)) $ _names s
 
-    T.putStrLn $ T.intercalate "\n\n" $ map (\(v,_) -> printInstructions 0 v) $ _functions s
 
-    header <- T.readFile "header.go"
-    T.writeFile "out.go" $ header <> "\n" <> 
-        (T.intercalate "" $ map typeToGo (Map.elems $ fst env)) <>
-        (T.intercalate "\n\n" $ map (\(a, (b, c)) -> functionToC a b c) (zip [0..] (_functions s))) <> "\n\n" <>
-        (T.intercalate "\n\n" $ map (\(a, b) -> "var " <> a <> " = _fn" <> T.pack (show (_curFn s - b - 1)) <> "()") $ newNames)
-        
+    case mappedNodes !? "main" of
+        Nothing -> putStrLn "ERROR: no main function found"
+        Just m -> let (_, s) = runState (monomorphizeFnTL m Map.empty) (MonomorphizerState [] [] mappedNodes)
+            in let mfns = _monomorphizedFns s
+            in do
+                let (r, s) = runState (traverse (\(_,_,a) -> linearizeTopLevel a) mfns) (LinearizerState [] 0 [] [])
+                let newNames = map (\(a,b) -> if a == "main" then ("_lmmain",b) else (a,b)) $ _names s
+                T.putStrLn $ T.intercalate "\n\n" $ map (\(v,_) -> printInstructions 0 v) $ _functions s
 
-    putStrLn ""
+                header <- T.readFile "header.go"
+                T.writeFile "out.go" $ header <> "\n" <> 
+                    (T.intercalate "" $ map typeToGo (Map.elems $ fst env)) <>
+                    (T.intercalate "\n\n" $ map (\(a, (b, c)) -> functionToC a b c) (zip [0..] (_functions s))) <> "\n\n" <>
+                    (T.intercalate "\n\n" $ map (\(a, b) -> "var _" <> a <> " = _fn" <> T.pack (show (_curFn s - b - 1)) <> "()") $ newNames)
 
-    callCommand "go run out.go"
+                putStrLn ""
+
+                callCommand "go run out.go"
+
+
+    
     -- case _functions s !? "main" of
     --     Nothing -> putStrLn "ERROR: no main function found"
     --     Just m -> 
