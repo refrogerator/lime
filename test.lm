@@ -11,10 +11,6 @@
 --     4 -> 5
 --
 
--- data Bool
---     = True 
---     | False
---
 -- bean :: Bool -> Int
 -- bean a = case a of
 --     True -> 6
@@ -26,12 +22,22 @@
 -- amogus a = case a of
 --     Test _ v -> v
 --     Joe -> 4
---
-const a b = b
+
+data Bool
+    = True 
+    | False
+
+gaming :: Bool -> a -> a -> a
+gaming a b c = case a of
+    True -> b
+    False -> c
+
+main = gaming True 6 7
+-- const a b = b
 
 -- main :: Int
--- main = amogus (Test False 20)
-main = const 1 2
+-- main = 20
+-- main = const 1 2
 
 -- id :: a -> a
 -- id a = a

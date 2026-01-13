@@ -391,8 +391,6 @@ type Typechecker a = ExceptT (Pos, TypecheckError) (State TypecheckerState) a
 
 instantiate :: Scheme -> Typechecker LimeType
 instantiate (Forall as t) = do
-    -- this seems dumb
-    -- probably just need number of tvars instead of array of names
     as' <- mapM (const freshTVar) as
     let s = Map.fromList $ zip as as'
     pure $ apply s t
@@ -427,7 +425,7 @@ typeLevelEval env@(tenv, _) n@(LimeNode node pos _) = case node of
     Infix FunArrow l r -> do
         (Forall lvs lt) <- typeLevelEval env l
         (Forall rvs rt) <- typeLevelEval env r
-        pure $ Forall [] $ TLambda lt rt
+        pure $ Forall (lvs <> rvs) $ TLambda lt rt
     _ -> throwError (pos, TEUnsupportedTLExpr n)
 
 freshTVar :: Typechecker LimeType
@@ -733,7 +731,7 @@ popBubble = gets bubble <* modify (\s -> s { bubble = "" })
 --     _ -> pure "" --throwError (pos, "unsupported expression " <> show n)
 
 printTypeEnv :: Map Text Scheme -> Text
-printTypeEnv env = foldl' (\b (n, t) -> b <> n <> " :: " <> printType (schemeType t) <> "\n") "" $ Map.toList env
+printTypeEnv env = foldl' (\b (n, (Forall s t)) -> b <> n <> " :: " <> (T.intercalate "" $ map (\a -> "p" <> T.pack (show a) <> " ") s) <> "=> " <>  printType t <> "\n") "" $ Map.toList env
 
 type Counter = State Int
 
@@ -1005,13 +1003,30 @@ monomorphize env n@(LimeNode node _ ninfo) = case node of
         r' <- monomorphize env r
         l' <- traverse (monomorphize env) l
         pure $ n { expr = Lambda l' r', info = apply env ninfo }
-    Int v -> pure n
+    Prefix op r -> do
+        r' <- monomorphize env r
+        pure n { expr = Prefix op r' }
+    Let l r -> do
+        -- doesn't work yet because needs pattern matching
+        l' <- monomorphize env l
+        r' <- monomorphize env r
+        pure n { expr = Let l' r' }
+    Case v cs -> do
+        v' <- monomorphize env v
+        cs' <- traverse (\(a, b) -> monomorphize env b >>= pure . (a,)) cs
+        pure n { expr = Case v' cs', info = apply env ninfo }
+    Discard -> pure n
+    Int _ -> pure n
+    Bool _ -> pure n
+    String _ -> pure n
+    List _ -> pure n
 
 monomorphizeFnTL :: LimeNode -> Map Int LimeType -> Monomorphizer ()
 monomorphizeFnTL n@(LimeNode node _ ninfo) env = case node of
     Infix AssignValue l@(LimeNode (Symbol s) _ _) r -> do
         r' <- monomorphize env r
         monomorphizedFns %= ((Just s, apply env ninfo, n { expr = Infix AssignValue l r', info = apply env ninfo }):)
+    _ -> pure ()
 
 collectNodeName :: LimeNode -> Maybe (Text, LimeNode)
 collectNodeName n@(LimeNode node _ _) = case node of
@@ -1067,6 +1082,17 @@ printInstruction i inst = T.replicate i " " <> case inst of
 printInstructions :: Int -> [Instruction] -> Text
 printInstructions i v = T.intercalate "\n" $ map (printInstruction i) v
 
+generateTypeName :: LimeType -> Text
+generateTypeName = \case
+    TLambda a r -> "L" <> generateTypeName a <> generateTypeName r
+    TVar i -> "p" <> T.pack (show i)
+    TPrim p -> case p of
+        PFloat _ -> "_Float"
+        PInt _ _ -> "_Int"
+    TADT n _ -> "_" <> n
+    TNamed n _ -> "_" <> n
+    Unchecked -> "Unchecked"
+
 main :: IO ()
 main = do
     test <- T.readFile "test.lm"
@@ -1093,6 +1119,10 @@ main = do
             in do
                 let (r, s) = runState (traverse (\(_,_,a) -> linearizeTopLevel a) mfns) (LinearizerState [] 0 [] [])
                 let newNames = map (\(a,b) -> if a == "main" then ("_lmmain",b) else (a,b)) $ _names s
+                T.putStrLn $ T.intercalate "\n" (map (\(a,b,_) -> case a of
+                    Just a' -> a' <> generateTypeName b <> " :: " <> printType b
+                    Nothing -> "") mfns)
+                T.putStrLn ""
                 T.putStrLn $ T.intercalate "\n\n" $ map (\(v,_) -> printInstructions 0 v) $ _functions s
 
                 header <- T.readFile "header.go"
@@ -1104,24 +1134,3 @@ main = do
                 putStrLn ""
 
                 callCommand "go run out.go"
-
-
-    
-    -- case _functions s !? "main" of
-    --     Nothing -> putStrLn "ERROR: no main function found"
-    --     Just m -> 
-    --         case snd env !? "main" of
-    --             Nothing -> putStrLn "ERROR: no main function found"
-    --             Just t -> do
-    --                 header <- T.readFile "header.d"
-    --                 T.writeFile "out.d" $ header <> "\n" <> functionToC "_hsmain" m t
-    -- case snd env !? "main" of
-    --     Nothing -> putStrLn "ERROR: no main function found"
-    --     Just m -> do
-    --         pure ()
-    --         header <- T.readFile "header.go"
-    --         T.writeFile "out.go" $ evalState (foldl' (\b a -> do
-    --             b' <- b
-    --             a' <- goBackend a
-    --             pure $ b' <> a' <> "\n") (pure header) ns) (GBackendState 0 "")
-    --         callCommand "go run out.go"
