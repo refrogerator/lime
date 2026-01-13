@@ -667,69 +667,6 @@ printTypeGo = \case
     TNamed _ t -> printTypeGo t
     Unchecked -> "Unchecked"
 
-data GBackendState = GBackendState
-    { ctr :: Int
-    , bubble :: Text
-    }
-
-type GBackend = State GBackendState
-
-getTempVar :: GBackend Int
-getTempVar = do
-    v <- get
-    put $ v { ctr = ctr v + 1 }
-    pure $ ctr v
-
-addBubble :: Text -> GBackend ()
-addBubble t = modify (\s -> s { bubble = bubble s <> "\n" <> t })
-
-popBubble :: GBackend Text
-popBubble = gets bubble <* modify (\s -> s { bubble = "" })
-
--- goBackend :: LimeNode -> GBackend Text
--- goBackend n@(LimeNode node pos ninfo) = case node of
---     Data _ _ -> pure $ fst $ foldl' f ("", 0) ms
---         where f (b, c) a = (b <> "var _cni" <> fst a <> " = " <> T.pack (show c) <> "\n" <> goGenerateConstructor a <> "\n", c+1)
---               (TADT _ ms) = ninfo
---     Infix AssignType _ _ -> pure ""
---     Infix AssignValue (LimeNode (Symbol "main") _ _) r -> do
---         r' <- goBackend r
---         pure $ "func main () {\n    fmt.Println(" <> r' <> ")\n}"
---     Infix AssignValue l r -> do
---         l' <- goBackend l
---         r' <- goBackend r
---         pure $ "var " <> l' <> " = " <> r'
---     Lambda [ln@(LimeNode (Symbol a) _ arg)] r@(LimeNode _ _ ret)  -> do
---         s <- get
---         r' <- goBackend r
---         -- b <- bubble <$> get
---         b <- popBubble
---         -- restore bubble
---         modify (\s' -> s' { bubble = bubble s })
---         pure $ "func (" <> a <> " " <> printTypeGo arg <> ") " <> printTypeGo ret <> " {\n" <> b <> "\n    return " <> r' <> "\n}"
---     FunCall f a -> do
---         f' <- goBackend f 
---         a' <- goBackend a
---         pure $ f' <> "(" <> a' <> ")"
---     Int v -> pure $ T.pack $ show v
---     Symbol s -> if isUpperCase $ T.head s then pure $ "_cnv" <> s else pure s
---     Case v cs -> do
---         tv <- (("_tv" <>) . T.pack . show) <$> getTempVar
---         v' <- goBackend v
---         let v'' = case info v of
---                 TADT _ _ -> v' <> ".t"
---                 _ -> v'
---         r' <- foldl' (\b (al, ar) -> do
---             b' <- b
---             al' <- goPMBackend al
---             ar' <- goBackend ar
---             pure $ b' <> "\ncase " <> al' <> ":\n\t" <> tv <> " = " <> ar') (pure "") cs 
---         -- let (TLambda _ ret) = info
---         addBubble $ "var " <> tv <> " " <> printTypeGo ninfo <> "\n" <> "switch " <> v'' <> "{" <> r' <> "\n}"
---         pure tv
---     -- catch all so the darn language server doesn't complain
---     _ -> pure "" --throwError (pos, "unsupported expression " <> show n)
-
 printTypeEnv :: Map Text Scheme -> Text
 printTypeEnv env = foldl' (\b (n, (Forall s t)) -> b <> n <> " :: " <> (T.intercalate "" $ map (\a -> "p" <> T.pack (show a) <> " ") s) <> "=> " <>  printType t <> "\n") "" $ Map.toList env
 
@@ -778,13 +715,6 @@ addTopLevelFunction n f t = do
     names %= ((n, i):)
 
 type Linearizer = State LinearizerState
-
-goPMBackend :: LimeNode -> GBackend Text
-goPMBackend n@(LimeNode node pos ninfo) = case node of
-    Int v -> pure $ T.pack $ show v
-    Symbol s -> if isUpperCase $ T.head s then pure $ "_cni" <> s else pure s
-    FunCall f a -> goPMBackend f
-    _ -> pure ""
 
 linearizePMCase :: LimeNode -> (Value, [Instruction], (Text, Int))
 linearizePMCase (LimeNode node pos ninfo) = case node of
