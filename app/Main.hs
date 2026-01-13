@@ -763,50 +763,50 @@ linearizeTopLevel n@(LimeNode node npos ninfo) = case node of
     -- Data name ms -> do
     _ -> pure ()
 
-data CBackendData = CBackendData
+data GoBackendData = GoBackendData
     { _stack :: [Int]
     , _counter :: Int
     }
     deriving Show
 
-makeLenses ''CBackendData
+makeLenses ''GoBackendData
 
-type CBackend = State CBackendData
+type GoBackend = State GoBackendData
 
 toCVar :: Int -> Text
 toCVar i = "_" <> T.pack (show i)
 
-popStack :: CBackend Text
+popStack :: GoBackend Text
 popStack = do
     s <- gets $ head . _stack
     stack %= tail
     pure $ toCVar s
 
-peekStack :: CBackend Text
+peekStack :: GoBackend Text
 peekStack = gets $ toCVar . head . _stack
 
-pushStack :: CBackend Text
+pushStack :: GoBackend Text
 pushStack = do
     c <- gets _counter
     counter %= (+1)
     stack %= (c:)
     pure $ toCVar c
 
-valueToGo :: Value -> CBackend Text
+valueToGo :: Value -> GoBackend Text
 valueToGo v = case v of
     VInt i -> pure $ T.pack (show i)
     VArray t v -> do
         v' <- (T.intercalate ", " <$> (traverse valueToGo v))
         pure $ "[]" <> printTypeGo t <> "{" <> v'
     VFunc (n, t, ret) is -> do
-        is' <- (T.intercalate "\n    " <$> (traverse linearizedToC is))
+        is' <- (T.intercalate "\n    " <$> (traverse linearizedToGo is))
         r' <- popStack
         pure $ "func (_" <> n <> " " <> printTypeGo t <> ") " <> printTypeGo ret <> " {\n    " <> is' <> "\n    return " <> r' <> "\n    }"
     VConstructorIndex t -> do
         pure $ "_cni" <> t
 
-linearizedToC :: Instruction -> CBackend Text
-linearizedToC = \case
+linearizedToGo :: Instruction -> GoBackend Text
+linearizedToGo = \case
     IApply -> do
         f <- popStack
         a <- popStack
@@ -839,7 +839,7 @@ linearizedToC = \case
                 s <- gets _stack
 
                 l' <- valueToGo l
-                r' <- T.intercalate "\n    " <$> (traverse linearizedToC r)
+                r' <- T.intercalate "\n    " <$> (traverse linearizedToGo r)
                 final <- popStack
 
                 stack .= s
@@ -857,11 +857,11 @@ linearizedToC = \case
         r <- pushStack
         pure $ r <> " := " <> v <> ".v.(_cns" <> n <> ")._" <> T.pack (show i)
 
-functionToC :: Int -> [Instruction] -> LimeType -> Text
-functionToC name is t = evalState f (CBackendData [] 0) 
+functionToGo :: Int -> [Instruction] -> LimeType -> Text
+functionToGo name is t = evalState f (GoBackendData [] 0) 
     where f = do
             let header = "func _fn" <> T.pack (show name) <> "() " <> printTypeGo t <> " {\n    "
-            v <- T.intercalate "\n    " <$> (traverse linearizedToC is)
+            v <- T.intercalate "\n    " <$> (traverse linearizedToGo is)
             r <- popStack
             pure $ header <> v <> "\n    return " <> r <> ";\n}"
 
@@ -1058,7 +1058,7 @@ main = do
                 header <- T.readFile "header.go"
                 T.writeFile "out.go" $ header <> "\n" <> 
                     (T.intercalate "" $ map typeToGo (Map.elems $ fst env)) <>
-                    (T.intercalate "\n\n" $ map (\(a, (b, c)) -> functionToC a b c) (zip [0..] (_functions s))) <> "\n\n" <>
+                    (T.intercalate "\n\n" $ map (\(a, (b, c)) -> functionToGo a b c) (zip [0..] (_functions s))) <> "\n\n" <>
                     (T.intercalate "\n\n" $ map (\(a, b) -> "var _" <> a <> " = _fn" <> T.pack (show (_curFn s - b - 1)) <> "()") $ newNames)
 
                 putStrLn ""
