@@ -57,8 +57,8 @@ data LimeExpr =
     | FunCall LimeNode LimeNode
     | Lambda [LimeNode] LimeNode
     | Let LimeNode LimeNode
-    -- name members
-    | Data Text [(Text, [LimeNode])]
+    -- name tvars members
+    | Data Text [Text] [(Text, [LimeNode])]
     -- value cases
     | Case LimeNode [(LimeNode, LimeNode)]
     | Discard
@@ -109,7 +109,7 @@ symbol :: Text -> Parser Text
 symbol = L.symbol scn
 
 limeSymbol :: Parser LimeExpr
-limeSymbol = Symbol . T.pack <$> lexeme (some (letterChar <|> char '_'))
+limeSymbol = Symbol . T.pack <$> lexeme (some (letterChar <|> numberChar <|> char '_'))
 
 limeInt :: Parser LimeExpr
 limeInt = Int . read @Int <$> lexeme (some digitChar)
@@ -126,9 +126,10 @@ limeData :: Parser LimeExpr
 limeData = do
     _ <- symbol "data"
     left <- T.pack <$> lexeme (some letterChar)
+    tvs <- many (T.pack <$> lexeme (some letterChar))
     _ <- symbol "="
-    right <- ((,) <$> (T.pack <$> lexeme (some letterChar)) <*> (many typeLevelNode)) `sepBy` symbol "|"
-    pure $ Data left right
+    right <- ((,) <$> (T.pack <$> lexeme (some letterChar)) <*> (many (limeTermToNode limeSymbol <|> limeTypeLevelParen))) `sepBy` symbol "|"
+    pure $ Data left tvs right
 
 caseBlock :: Parser [(LimeNode, LimeNode)]
 caseBlock = (some (p <* lexeme eol))
@@ -177,7 +178,7 @@ limeExprToNode p = do
     pure (\a@(LimeNode _ (start, _) _) b@(LimeNode _ (_, end) _) -> LimeNode (r a b) (start, end) Unchecked)
 
 keyword :: Parser ()
-keyword = void $ choice ["of"]
+keyword = void $ choice ["of", "in"]
 
 limeDiscard :: Parser LimeExpr
 limeDiscard = Discard <$ symbol "_"
@@ -197,9 +198,9 @@ indentBracket p = do
         ISSet a -> ISUnset $ a + 1
         a -> a)
     res <- p
-    case o of
-        ISUnset _ -> put ISInvalid
-        _ -> put o
+    -- case o of
+    --     ISUnset _ -> put ISInvalid
+    --     _ -> put o
     pure res
 
 limeTopLevel :: Parser LimeNode
@@ -212,11 +213,17 @@ limeTopLevel = L.nonIndented scn $ (put $ ISSet 1) *> indentBracket (limeTopLeve
             r <- p2
             pure $ nodesToInfix op l r
 
+limeTypeLevelParen :: Parser LimeNode
+limeTypeLevelParen = between (symbol "(") (symbol ")") typeLevelNode
+
 typeLevelNode :: Parser LimeNode
-typeLevelNode = E.makeExprParser (limeTermToNode limeSymbol) table
+typeLevelNode = E.makeExprParser (limeTermToNode limeSymbol <|> limeTypeLevelParen) table
     where
-        table =
-            [ [ binaryR "->" FunArrow ] ]
+        table = 
+            [ [ binary' "" FunCall ]
+            , [ binaryR "->" FunArrow ] 
+            ]
+        binary' s op = E.InfixL $ limeExprToNode (op <$ symbol s)
         binaryR s op = E.InfixR $ limeExprToNode (Infix op <$ symbol s)
 
 limeNode :: Parser LimeNode
@@ -295,8 +302,9 @@ simplifyLime n@(LimeNode node pos _) = case node of
         n { expr = Prefix op $ simplifyLime r }
     Let l r ->
         n { expr = Let (simplifyLime l) (simplifyLime r) }
-    Data _ _ -> n
-    Case _ _ -> n
+    Data _ _ _ -> n
+    Case v cs ->
+        n { expr = Case (simplifyLime v) ((\(a,b) -> (a, simplifyLime b)) <$> cs) }
     Discard -> n
 
 printNode :: LimeNode -> Text
@@ -319,7 +327,7 @@ printNode n@(LimeNode node _ _) = case node of
     Bool b -> T.pack $ show b
     String s -> s
     List s -> "[" <> foldl' (\b a -> b <> printNode a <> " ") "" s <> "]"
-    Data n ns -> "data " <> n <> " = " <> T.intercalate " | " (map (\(a, b) -> a <> (T.intercalate " " (map printNode b))) ns)
+    Data n tvs ns -> "data " <> n <> (if null tvs then "" else " " <> T.intercalate " " tvs) <> " = " <> T.intercalate " | " (map (\(a, b) -> a <> " " <> (T.intercalate " " (map printNode b))) ns)
     Case v cs -> "case " <> printNode v <> " of\n    " <> (T.intercalate "\n    " $ map (\(l, r) -> printNode l <> " -> " <> printNode r) cs)
     Prefix op r ->
         ""
@@ -332,19 +340,23 @@ data LimePrim
     = PInt Int Bool
     -- size, name
     | PFloat Int
-    deriving (Show, Eq)
+    deriving (Show, Eq, Ord)
 
 data LimeType =
     -- arg ret
     TLambda LimeType LimeType
     -- type vars
+    -- do i need a type-level tvar?
     | TVar Int
     | TPrim LimePrim
-    | TADT Text [(Text, [LimeType])]
+    -- name, fields, applied types
+    | TADT Text [(Text, [LimeType])] [LimeType]
+    -- recursive ADT (name, applied types)
+    | TRec Text [LimeType]
     | TNamed Text LimeType
     -- no assigned type
     | Unchecked
-    deriving (Show, Eq)
+    deriving (Show, Eq, Ord)
 
 printType :: LimeType -> Text
 printType = \case
@@ -356,7 +368,8 @@ printType = \case
         PInt _ _ -> "Int" 
         PFloat _ -> "Float"
     TVar i -> "p" <> T.pack (show i)
-    TADT n ms -> n <> " (" <> T.intercalate " | " (map (\(n', ts) -> n' <> if null ts then "" else " " <> T.intercalate " " (map printType ts)) ms) <> ")"
+    TADT n ms ats -> n <> T.intercalate "" (map (\at -> " " <> printType at) ats) <>  " (" <> T.intercalate " | " (map (\(n', ts) -> n' <> if null ts then "" else " " <> T.intercalate " " (map (\t -> "(" <> printType t <> ")") ts)) ms) <> ")"
+    TRec t ats -> t <> T.intercalate "" (map (\at -> " " <> printType at) ats)
     TNamed t _ -> t
     Unchecked -> "Unchecked"
 
@@ -417,15 +430,22 @@ findTypeError env n pos = findTypeEnv env n >>= \case
 
 typeLevelEval :: TypeEnv -> LimeNode -> Typechecker Scheme
 typeLevelEval env@(tenv, _) n@(LimeNode node pos _) = case node of
-    Symbol s -> if isUpperCase $ T.head s 
-        then case tenv !? s of
+    Symbol s -> case tenv !? s of
             Just a -> pure a
-            Nothing -> throwError (pos, TETypeNotFound s)
-        else freshTVar >>= \(TVar v) -> pure $ Forall [v] $ TVar v
+            Nothing -> if isUpperCase $ T.head s 
+                then throwError (pos, TETypeNotFound s)
+                -- keep track of created tvars in env
+                else freshTVar >>= \(TVar v) -> pure $ Forall [v] $ TVar v
     Infix FunArrow l r -> do
         (Forall lvs lt) <- typeLevelEval env l
         (Forall rvs rt) <- typeLevelEval env r
         pure $ Forall (lvs <> rvs) $ TLambda lt rt
+    FunCall f a -> do
+        f' <- typeLevelEval env f
+        let (Forall (ftv:ftvs) f'') = f'
+        a' <- typeLevelEval env a
+        b <- bind pos ftv $ schemeType a'
+        pure (Forall ftvs $ apply b f'')
     _ -> throwError (pos, TEUnsupportedTLExpr n)
 
 freshTVar :: Typechecker LimeType
@@ -433,6 +453,12 @@ freshTVar = do
     n <- use curTVar
     curTVar %= (+1)
     pure $ TVar n
+
+freshTVarI :: Typechecker Int
+freshTVarI = do
+    n <- use curTVar
+    curTVar %= (+1)
+    pure n
 
 schemeType :: Scheme -> LimeType
 schemeType (Forall _ t) = t
@@ -443,13 +469,23 @@ getType (LimeNode _ _ t) = t
 apply :: Subst -> LimeType -> LimeType
 apply s t@(TVar v) = Map.findWithDefault t v s
 apply s (TLambda a r) = TLambda (apply s a) (apply s r)
+apply s (TADT t ms ats) = TADT t (map (\(a, ts) -> (a, map (apply s) ts)) ms) $ map (apply s) ats
+apply s (TRec t ats) = TRec t $ map (apply s) ats
 apply _ t = t
 
 applyS :: Subst -> Scheme -> Scheme
-applyS s (Forall as t) = Forall as $ apply s t
+applyS s (Forall as t) = Forall as $ apply s' t
+    where s' = foldr Map.delete s as
 
 applyEnv :: Subst -> TypeEnv -> TypeEnv
 applyEnv s (tenv, venv) = (tenv, Map.map (applyS s) venv)
+
+unifyList :: Pos -> [LimeType] -> [LimeType] -> Typechecker Subst
+unifyList pos as bs = foldl' helper (pure Map.empty) $ zip as bs
+    where helper b (ta,tb) = do
+            s1 <- b
+            s2 <- unify pos (apply s1 ta) (apply s1 tb)
+            pure $ Map.union s2 s1
 
 unify :: Pos -> LimeType -> LimeType -> Typechecker Subst
 unify pos (TNamed _ a) (TNamed _ b) = unify pos a b
@@ -461,8 +497,12 @@ unify pos (TLambda l1 r1) (TLambda l2 r2) = do
     pure $ Map.union s2 s1
 unify pos (TVar a) t = bind pos a t
 unify pos t (TVar a) = bind pos a t
+-- TODO see whether there's limits to using nominalism beyond type application
+unify pos (TRec a ats) (TRec b bts) | a == b = unifyList pos ats bts
+unify pos (TRec a ats) (TADT b _ bts) | a == b = unifyList pos ats bts
+unify pos (TADT a _ ats) (TRec b bts) | a == b = unifyList pos ats bts
+unify pos (TADT a _ ats) (TADT b _ bts) | a == b = unifyList pos ats bts
 unify _ (TPrim a) (TPrim b) | a == b = pure Map.empty
-unify _ (TADT na _) (TADT nb _) | na == nb = pure Map.empty
 unify pos t1 t2 = throwError $ (pos, TEMismatch t1 t2)
 
 occurs :: Int -> LimeType -> Bool
@@ -470,8 +510,9 @@ occurs v = \case
     TLambda t1 t2 -> occurs v t1 && occurs v t2
     TVar v' -> v == v'
     TPrim _ -> False
-    -- TODO fix occurs check for ADT
-    TADT _ _ -> False
+    -- TODO fix occurs check for ADT, TRec, TFun and TApp
+    TRec _ _ -> False
+    TADT _ _ _ -> False
     TNamed _ t -> occurs v t
     Unchecked -> False
 
@@ -493,7 +534,8 @@ freeTypeVars = \case
     TVar a -> Set.singleton a
     TPrim _ -> Set.empty
     -- TODO fix tvar check for ADTS once generic
-    TADT _ _ -> Set.empty
+    TRec _ ats -> Set.unions $ map freeTypeVars ats
+    TADT _ ms ats -> Set.union (Set.unions $ concatMap (map freeTypeVars . snd) ms) (Set.unions $ map freeTypeVars ats)
     TNamed _ t -> freeTypeVars t
     Unchecked -> Set.empty
 
@@ -545,6 +587,7 @@ typecheck env n@(LimeNode node npos _) = case node of
         (s1, f') <- typecheck env f
         (s2, a') <- typecheck (applyEnv s1 env) a
         s3 <- unify npos (apply s2 $ getType f') (TLambda (getType a') tv)
+        -- pure (Map.unions [trace (show s3 <> " " <> show f') s3, s2, s1], n { expr = FunCall f' a', info = apply s3 tv })
         pure (Map.unions [s3, s2, s1], n { expr = FunCall f' a', info = apply s3 tv })
     Case v cs -> do
         (s1, v') <- typecheck env v 
@@ -557,16 +600,18 @@ typecheck env n@(LimeNode node npos _) = case node of
                 ((so, env), cs') <- b
                 (env', l') <- typecheckPatternMatch env l
                 (s2, r') <- typecheck env' r
-                s3 <- unify (pos l) (info v') (info l')
+                let l'' = l' { info = apply s2 $ info l' }
+                s3 <- unify (pos l) (info v') (info l'')
                 sn <- case cs' of
                         (c:_) -> do
                             s4 <- unify (pos r) (info $ snd c) (info r')
                             -- dunno if i even need this but i'm keeping it 4 now
-                            s5 <- unify (pos l) (info $ fst c) (info l')
+                            s5 <- unify (pos l) (info $ fst c) (info l'')
                             pure $ Map.unions [s1, s2, s3, s4, s5]
-                        [] -> pure $ Map.union s1 s2
+                        [] -> pure $ Map.unions [s1, s2, s3]
                 let env'' = applyEnv sn env'
-                pure ((Map.union so sn, env''), (l', r'):cs')
+                pure ((Map.union so sn, env''), (l'', r'):cs')
+        -- TODO don't reverse the list
         ((s2, env''), cs') <- foldl' check (pure ((s1, env'), [])) cs
         -- this is crucial so that the type of v' can be determined
         let v'' = v' { info = apply s2 $ info v' }
@@ -583,6 +628,9 @@ topLevelTypecheck env@(tenv, venv) n@(LimeNode expr pos _) = case expr of
         curTVar .= 0
         pure $ ((tenv, Map.insert s rt venv), n)
     Infix AssignValue a@(LimeNode (Symbol s) _ _) b -> do
+        -- tv <- freshTVar
+        -- -- TODO IMPORTANT add proper recursiveness checking
+        -- (s1, b') <- typecheck (tenv, Map.insert s (Forall [] tv) venv) b
         (s1, b') <- typecheck env b
         let env'  = applyEnv s1 env
             t'    = generalize env' $ getType b'
@@ -591,11 +639,15 @@ topLevelTypecheck env@(tenv, venv) n@(LimeNode expr pos _) = case expr of
             Nothing -> pure $ (tenv, Map.insert s t' venv)
         curTVar .= 0
         pure $ (env'', n { expr = Infix AssignValue a b', info = getType b' })
-    Data name ms -> do
-        ms' <- mapM (\(a, b) -> mapM (\x -> schemeType <$> typeLevelEval env x) b >>= pure . (a,)) ms
-        let t = TADT name ms'
-            env' = (Map.insert name (Forall [] t) tenv, venv)
-            env'' = foldl' (\b (a, cs) -> (fst b, Map.insert a (Forall [] (foldl' (\t ti -> TLambda ti t) t $ reverse cs)) $ snd b)) env' ms'
+    Data name tvs ms -> do
+        tvs' <- traverse (const freshTVarI) tvs
+        let tvs'' = map TVar tvs'
+            tempEnv = foldl' insertTVs (Map.insert name (Forall tvs' (TRec name tvs'')) tenv, venv) $ zip tvs tvs''
+            insertTVs (tenv, venv) (n,v) = (Map.insert n (Forall [] v) tenv, venv)
+        ms' <- mapM (\(a, b) -> mapM (\x -> schemeType <$> typeLevelEval tempEnv x) b >>= pure . (a,)) ms
+        let t = TADT name ms' tvs''
+            env' = (Map.insert name (Forall tvs' t) tenv, venv)
+            env'' = foldl' (\b (a, cs) -> (fst b, Map.insert a (Forall tvs' (foldl' (\t ti -> TLambda ti t) t $ reverse cs)) $ snd b)) env' ms'
         pure $ (env'', n { info = t })
     _ -> (\(_, b) -> (env, b)) <$> typecheck env n
 
@@ -611,16 +663,20 @@ defaultTypes =
       ("Float", Forall [] $ TNamed "Float" $ TPrim $ PFloat 4)
     ]
 
-defaultValues :: [(Text, Scheme)]
-defaultValues =
+builtinFunctions :: Map Text Scheme
+builtinFunctions = Map.fromList
     [ ("__add", Forall [] $ infixType defInt),
       ("__sub", Forall [] $ infixType defInt),
       ("__mul", Forall [] $ infixType defInt),
       ("__div", Forall [] $ infixType defInt)
     ]
 
+defaultValues :: Map Text Scheme
+defaultValues =
+    builtinFunctions
+
 defaultTypeEnv :: TypeEnv
-defaultTypeEnv = (Map.fromList defaultTypes, Map.fromList defaultValues)
+defaultTypeEnv = (Map.fromList defaultTypes, defaultValues)
 
 typecheckAllI :: [LimeNode] -> TypeEnv -> Typechecker (TypeEnv, [LimeNode])
 typecheckAllI [] env = pure (env, [])
@@ -663,12 +719,13 @@ printTypeGo = \case
     TPrim p -> case p of
         PFloat _ -> "float"
         PInt _ _ -> "int"
-    TADT _ _ -> "ADT"
+    TADT _ _ _ -> "ADT"
+    TRec _ _ -> "ADT"
     TNamed _ t -> printTypeGo t
     Unchecked -> "Unchecked"
 
 printTypeEnv :: Map Text Scheme -> Text
-printTypeEnv env = foldl' (\b (n, (Forall s t)) -> b <> n <> " :: " <> (T.intercalate "" $ map (\a -> "p" <> T.pack (show a) <> " ") s) <> "=> " <>  printType t <> "\n") "" $ Map.toList env
+printTypeEnv env = foldl' (\b (n, (Forall s t)) -> b <> n <> " :: " <> (if null s then "" else (T.intercalate "" $ map (\a -> "p" <> T.pack (show a) <> " ") s) <> "=> ") <>  printType t <> "\n") "" $ Map.toList env
 
 type Counter = State Int
 
@@ -745,7 +802,7 @@ linearize n@(LimeNode node npos ninfo) = case node of
             let (l', lr, _) = linearizePMCase l
             pure (l', [IFlip] <> lr <> [IDrop] <> r')) cs
         let adtStuff = case vinfo of
-                TADT _ _ -> [IDup, IGetVal "_adtType", IApply]
+                TADT _ _ _ -> [IDup, IGetVal "_adtType", IApply]
                 _ -> []
         pure $ v' <> adtStuff <> [ISwitch ninfo cs']
     _ -> error $ T.unpack $ printNode n
@@ -766,6 +823,7 @@ linearizeTopLevel n@(LimeNode node npos ninfo) = case node of
 data GoBackendData = GoBackendData
     { _stack :: [Int]
     , _counter :: Int
+    , _recs :: Map Text Int
     }
     deriving Show
 
@@ -818,7 +876,11 @@ linearizedToGo = \case
         pure $ r <> " := " <> v'
     IGetVal v -> do
         r <- pushStack
-        pure $ r <> " := " <> if isUpperCase $ T.head v then "_cnv" <> v else "_" <> v
+        rs <- gets _recs
+        pure $ r <> " := " <> if isUpperCase $ T.head v then "_cnv" <> v else
+            case rs !? v of
+                Just f -> "_fn" <> T.pack (show f) <> "()"
+                Nothing -> "_" <> v
     IDup -> do
         v <- gets $ head . _stack
         stack %= (v:)
@@ -857,8 +919,8 @@ linearizedToGo = \case
         r <- pushStack
         pure $ r <> " := " <> v <> ".v.(_cns" <> n <> ")._" <> T.pack (show i)
 
-functionToGo :: Int -> [Instruction] -> LimeType -> Text
-functionToGo name is t = evalState f (GoBackendData [] 0) 
+functionToGo :: Int -> [Instruction] -> LimeType -> Text -> Text
+functionToGo name is t tname = evalState f (GoBackendData [] 0 (Map.singleton tname name)) 
     where f = do
             let header = "func _fn" <> T.pack (show name) <> "() " <> printTypeGo t <> " {\n    "
             v <- T.intercalate "\n    " <$> (traverse linearizedToGo is)
@@ -876,20 +938,52 @@ goGenerateConstructor (name, ts) = if null ts then cnvDef <> "ADT{" <> cniName <
           recvCnv tsf@(t:ts) s i = "func (_" <> T.pack (show i) <> " " <> printTypeGo t <> ") " <> printTypeGo (recvCnvType ts) <> " {\n    return " <> recvCnv ts s (i+1) <> "}"
           recvCnv [] s _ = s
           recvCnvType :: [LimeType] -> LimeType
-          recvCnvType [t] = TLambda t $ TADT "" []
+          recvCnvType [t] = TLambda t $ TADT "" [] []
           recvCnvType (t:ts) = TLambda t $ recvCnvType ts
           recvCnvType [] = Unchecked
 
-typeToGo :: Scheme -> Text
-typeToGo (Forall _ t) = case t of
-    TADT _ ms -> (fst $ foldl' f ("", 0) ms) <> "\n"
+-- rename type later
+typeToGo :: LimeType -> Text
+typeToGo t = case t of
+    TADT _ ms _ -> (fst $ foldl' f ("", 0) ms) <> "\n"
         where f (b, c) a = (b <> "var _cni" <> fst a <> " = " <> T.pack (show c) <> "\n" <> goGenerateConstructor a <> "\n", c+1)
     _ -> ""
 
+data Literal 
+    = LInt Int
+    | LFloat Float
+    | LString Text
+    | LList [Literal]
+
+data IR
+    -- name type
+    = IRVar Text LimeType
+    -- literal
+    | IRLit Literal
+    -- fn arg
+    | IRApp IR IR
+    -- argname rhs
+    | IRLam Text IR
+    -- type lambda, arg
+    | IRTApp IR LimeType
+    -- tvar rhs
+    | IRTLam Int IR
+    -- name rhs
+    | IRLet Text IR
+    -- TBD
+    | IRCase
+
+data FType
+    = FTFn LimeNode
+    | FTCon Text
+    deriving Show
+
 data MonomorphizerState = MonomorphizerState
     { _monomorphizedFns :: [(Maybe Text, LimeType, LimeNode)]
-    , _reqTypes :: [(Text, [LimeType])]
-    , _mFunctions :: (Map Text LimeNode)
+    , _reqTypes :: Set.Set (Text, LimeType)
+    , _mFunctions :: (Map Text FType)
+    , _mTypes :: (Map Text Scheme)
+    , _curMFn :: Text
     }
     deriving Show
 
@@ -897,7 +991,7 @@ makeLenses ''MonomorphizerState
 
 type Monomorphizer = State MonomorphizerState
 
-monomorphizeFunCall :: LimeNode -> Map Int LimeType -> Monomorphizer (LimeNode, Maybe LimeNode, LimeType, Map Int LimeType)
+monomorphizeFunCall :: LimeNode -> Map Int LimeType -> Monomorphizer (LimeNode, Maybe FType, LimeType, Map Int LimeType)
 monomorphizeFunCall n@(LimeNode node _ ninfo) env = case node of
     FunCall f a -> do
         (f', n', ft, fnEnv) <- monomorphizeFunCall f env
@@ -913,11 +1007,19 @@ monomorphizeFunCall n@(LimeNode node _ ninfo) env = case node of
             _ -> f ft ft
     Symbol s -> do
         v <- gets _mFunctions
-        case v !? s of
-            -- not sure about this one
-            -- should probably apply
-            Just f -> monomorphize env n >>= \n' -> pure (n', Just f, info f, Map.empty)
-            Nothing -> error "could not find function in env"
+        cur <- gets _curMFn
+        if s == cur then
+            pure (n, Nothing, ninfo, Map.empty)
+        else
+            case v !? s of
+                -- not sure about this one
+                -- should probably apply
+                Just mf -> case mf of
+                    FTFn f -> monomorphize env n >>= \n' -> pure (n', Just mf, info f, Map.empty)
+                    FTCon _ -> pure (n, Just mf, ninfo, Map.empty)
+                Nothing -> case builtinFunctions !? s of
+                    Just _ -> pure (n, Nothing, ninfo, Map.empty)
+                    Nothing -> error $ "could not find function " <> T.unpack s <> " in env"
     _ -> monomorphize env n >>= \n' -> pure (n', Nothing, ninfo, Map.empty)
 
 monomorphize :: Map Int LimeType -> LimeNode -> Monomorphizer LimeNode
@@ -925,7 +1027,9 @@ monomorphize env n@(LimeNode node _ ninfo) = case node of
     FunCall f a -> do
         (n', r, _, fnEnv) <- monomorphizeFunCall n env
         case r of
-            Just r' -> monomorphizeFnTL r' fnEnv
+            Just r' -> case r' of
+                FTFn r'' -> monomorphizeFnTL r'' fnEnv
+                FTCon c -> reqTypes %= Set.insert (c, ninfo)
             Nothing -> pure ()
         pure $ n' { info = apply env ninfo }    
     Symbol s -> pure $ n { info = apply env ninfo }
@@ -954,21 +1058,24 @@ monomorphize env n@(LimeNode node _ ninfo) = case node of
 monomorphizeFnTL :: LimeNode -> Map Int LimeType -> Monomorphizer ()
 monomorphizeFnTL n@(LimeNode node _ ninfo) env = case node of
     Infix AssignValue l@(LimeNode (Symbol s) _ _) r -> do
+        cur <- gets _curMFn
+        curMFn .= s
         r' <- monomorphize env r
         monomorphizedFns %= ((Just s, apply env ninfo, n { expr = Infix AssignValue l r', info = apply env ninfo }):)
+        curMFn .= cur
     _ -> pure ()
 
 collectNodeName :: LimeNode -> Maybe (Text, LimeNode)
 collectNodeName n@(LimeNode node _ _) = case node of
     Infix AssignType (LimeNode (Symbol s) _ _) _ -> Just (s, n)
     Infix AssignValue (LimeNode (Symbol s) _ _) _ -> Just (s, n)
-    Data name _ -> Just (name, n)
+    -- data declarations aren't collected because they don't belong in the var env
     _ -> Nothing
 
-collectNodeNames :: [LimeNode] -> Map Text LimeNode
+collectNodeNames :: [LimeNode] -> Map Text FType
 collectNodeNames ns = foldl' f Map.empty ns
     where f b n = case collectNodeName n of
-            Just (l, r) -> Map.insert l r b
+            Just (l, r) -> Map.insert l (FTFn r) b
             Nothing -> b
 
 parseLime :: String -> Text -> IO [LimeNode]
@@ -1019,9 +1126,18 @@ generateTypeName = \case
     TPrim p -> case p of
         PFloat _ -> "_Float"
         PInt _ _ -> "_Int"
-    TADT n _ -> "_" <> n
+    -- add type applications to the end
+    TADT n _ _ -> "_" <> n
     TNamed n _ -> "_" <> n
     Unchecked -> "Unchecked"
+
+collectConstructors :: [LimeType] -> [(Text, FType)]
+collectConstructors ts = concatMap getConstructors $ filter isADT ts
+    where isADT t = case t of
+            TADT _ _ _ -> True
+            _ -> False
+          getConstructors t = case t of
+            TADT n cs _ -> zip (map fst cs) (repeat $ FTCon n)
 
 main :: IO ()
 main = do
@@ -1035,7 +1151,7 @@ main = do
 
     let mappedNodes = collectNodeNames ns
 
-    T.putStrLn $ T.intercalate "\n" $ fmap (\(a,b) -> a <> ": " <> printNode b) $ Map.toList $ mappedNodes
+    T.putStrLn $ T.intercalate "\n" $ fmap (\(a,b) -> let FTFn b' = b in a <> ": " <> printNode b') $ Map.toList $ mappedNodes
 
 
     T.putStrLn $ printTypeEnv $ fst env
@@ -1044,21 +1160,27 @@ main = do
 
     case mappedNodes !? "main" of
         Nothing -> putStrLn "ERROR: no main function found"
-        Just m -> let (_, s) = runState (monomorphizeFnTL m Map.empty) (MonomorphizerState [] [] mappedNodes)
-            in let mfns = _monomorphizedFns s
-            in do
+        Just m -> let (_, s)    = runState (monomorphizeFnTL m' Map.empty) (MonomorphizerState [] Set.empty envFns (fst env) "")
+                      envFns    = (Map.fromList $ collectConstructors $ map schemeType $ Map.elems $ fst env) <> mappedNodes
+                      (FTFn m') = m
+                      mfns      = _monomorphizedFns s
+                      rtypes    = _reqTypes s
+                in do
                 let (r, s) = runState (traverse (\(_,_,a) -> linearizeTopLevel a) mfns) (LinearizerState [] 0 [] [])
                 let newNames = map (\(a,b) -> if a == "main" then ("_lmmain",b) else (a,b)) $ _names s
                 T.putStrLn $ T.intercalate "\n" (map (\(a,b,_) -> case a of
                     Just a' -> a' <> generateTypeName b <> " :: " <> printType b
                     Nothing -> "") mfns)
                 T.putStrLn ""
+                print $ rtypes
                 T.putStrLn $ T.intercalate "\n\n" $ map (\(v,_) -> printInstructions 0 v) $ _functions s
+                -- print m
 
                 header <- T.readFile "header.go"
                 T.writeFile "out.go" $ header <> "\n" <> 
-                    (T.intercalate "" $ map typeToGo (Map.elems $ fst env)) <>
-                    (T.intercalate "\n\n" $ map (\(a, (b, c)) -> functionToGo a b c) (zip [0..] (_functions s))) <> "\n\n" <>
+                    (T.intercalate "" $ map typeToGo $ map schemeType $ filter (\(Forall tvs _) -> null tvs) (Map.elems $ fst env)) <>
+                    (T.intercalate "" $ map (typeToGo . snd) $ Set.elems rtypes) <>
+                    (T.intercalate "\n\n" $ map (\(a, ((b, c), d)) -> functionToGo a b c d) (zip [0..] (zip (_functions s) (map fst newNames)))) <> "\n\n" <>
                     (T.intercalate "\n\n" $ map (\(a, b) -> "var _" <> a <> " = _fn" <> T.pack (show (_curFn s - b - 1)) <> "()") $ newNames)
 
                 putStrLn ""

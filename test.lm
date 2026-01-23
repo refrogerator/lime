@@ -16,6 +16,11 @@
 --     True -> 6
 --     False -> 7
 --
+
+-- data Bool
+--     = True
+--     | False
+--
 -- data Test = Test Bool Int | Joe
 --
 -- amogus :: Test -> Int
@@ -23,23 +28,45 @@
 --     Test _ v -> v
 --     Joe -> 4
 
-data Bool
-    = True 
-    | False
+--
+-- gaming :: Bool -> a -> a -> a
+-- gaming a b c = case a of
+--     True -> b
+--     False -> c
 
-gaming :: Bool -> a -> a -> a
-gaming a b c = case a of
-    True -> b
-    False -> c
+-- data List a = Cons a (List a) | Nil
+data List a = Cons a (List a) | Nil
 
-main = gaming True 6 7
+-- funny n = case n of
+--     Cons i l -> i + funny l
+--     Nil -> 0
+funny :: List Int -> Int
+funny n = case n of
+    Cons i l -> i + funny l
+    Nil -> 0
+
+-- funny1 :: List Int -> Int
+-- funny1 n = case n of
+--     Cons i l -> i + funny1 l
+--     Nil -> 0
+--
+-- main = (Cons 1 (Cons True (Cons 3 Nil)))
+-- main = funny (Cons (funny1 (Cons 1 Nil)) (Cons 2 (Cons 3 Nil)))
+main = funny (Cons 1 (Cons 2 (Cons 3 Nil)))
+-- main = Cons 1 Nil
+-- main = 1
+
+-- main = gaming True 6 7
 -- const a b = b
 
 -- main :: Int
--- main = 20
+-- main = True 4
+-- main = Test False 20
 -- main = const 1 2
 
 -- id :: a -> a
 -- id a = a
+
+-- main = 20
 
 -- joe a b = a + b

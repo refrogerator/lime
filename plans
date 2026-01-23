@@ -1,8 +1,7 @@
 - intern all typeclasses
 - lists
-- data
 - adts with generics
 - renaming pass at the very start that interns everything
-- monomorphization pass after typechecking
 - out of order declaration
 - function node with multiple arguments for easier typechecking
+- constraint generation -> constraint solving
