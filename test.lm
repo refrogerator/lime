@@ -57,7 +57,11 @@
 -- ones :: List Int
 -- ones = Cons 1 ones
 
-main = 2 + let a = 4 in a + 5
+-- main = 2 + let a = 4
+--                b = 5
+--     in a + b
+
+main = 2 + let a b = 4 + b in a 3
 
 -- main = funny (Cons 1 (Cons 2 (Cons 3 Nil)))
 -- main = funny ones

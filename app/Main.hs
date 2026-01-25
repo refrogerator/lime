@@ -306,7 +306,8 @@ simplifyLime n@(LimeNode node pos _) = case node of
     Prefix op r ->
         n { expr = Prefix op $ simplifyLime r }
     Let l r e ->
-        n { expr = Let (simplifyLime l) (simplifyLime r) (simplifyLime e) }
+        n { expr = Let l' r' (simplifyLime e) }
+        where (l', r') = simplifyPatternMatch l $ simplifyLime r
     Data _ _ _ -> n
     Case v cs ->
         n { expr = Case (simplifyLime v) ((\(a,b) -> (a, simplifyLime b)) <$> cs) }
@@ -334,9 +335,9 @@ printNode n@(LimeNode node _ _) = case node of
     List s -> "[" <> foldl' (\b a -> b <> printNode a <> " ") "" s <> "]"
     Data n tvs ns -> "data " <> n <> (if null tvs then "" else " " <> T.intercalate " " tvs) <> " = " <> T.intercalate " | " (map (\(a, b) -> a <> " " <> (T.intercalate " " (map printNode b))) ns)
     Case v cs -> "case " <> printNode v <> " of\n    " <> (T.intercalate "\n    " $ map (\(l, r) -> printNode l <> " -> " <> printNode r) cs)
-    Prefix op r ->
-        ""
     Let l r e ->
+        "let " <> printNode l <> " = " <> printNode r <> " in " <> printNode e
+    Prefix op r ->
         ""
     Discard -> "_"
 
@@ -1077,11 +1078,13 @@ monomorphize env n@(LimeNode node _ ninfo) = case node of
         r' <- monomorphize env r
         pure n { expr = Prefix op r' }
     Let l r e -> do
+        -- TODO monomorphize lets
         -- doesn't work yet because needs pattern matching
-        l' <- monomorphize env l
-        r' <- monomorphize env r
-        e' <- monomorphize env e
-        pure n { expr = Let l' r' e' }
+        -- l' <- monomorphize env l
+        -- r' <- monomorphize env r
+        -- e' <- monomorphize env e
+        -- pure n { expr = Let l' r' e' }
+        pure n
     Case v cs -> do
         v' <- monomorphize env v
         cs' <- traverse (\(a, b) -> monomorphize env b >>= pure . (a,)) cs
