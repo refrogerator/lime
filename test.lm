@@ -35,29 +35,32 @@
 --     False -> c
 
 -- data List a = Cons a (List a) | Nil
-data List a = Cons a (List a) | Nil
+-- data List a = Cons a (List a) | Nil
 
 -- funny n = case n of
 --     Cons i l -> i + funny l
 --     Nil -> 0
-funny :: List Int -> Int
-funny n = case n of
-    Cons i l -> i + funny l
-    Nil -> 0
+
+-- funny :: List Int -> Int
+-- funny n = case n of
+--     Cons i l -> i + funny l
+--     Nil -> 0
 
 -- funny1 :: List Int -> Int
 -- funny1 n = case n of
 --     Cons i l -> i + funny1 l
 --     Nil -> 0
---
+
 -- main = (Cons 1 (Cons True (Cons 3 Nil)))
 -- main = funny (Cons (funny1 (Cons 1 Nil)) (Cons 2 (Cons 3 Nil)))
 
 -- ones :: List Int
 -- ones = Cons 1 ones
 
+main = 2 + let a = 4 in a + 5
+
+-- main = funny (Cons 1 (Cons 2 (Cons 3 Nil)))
 -- main = funny ones
-main = funny (Cons 1 (Cons 2 (Cons 3 Nil)))
 -- main = Cons 1 Nil
 -- main = 1
 

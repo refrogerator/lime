@@ -27,6 +27,7 @@ import System.Process (callCommand)
 import System.Exit (exitFailure)
 import Debug.Trace (trace)
 import qualified Data.Text.Internal.Fusion.Size as T
+import Control.Exception (assert)
 
 -- not sure if ISInvalid is even needed
 data IndentationState = ISUnset Int | ISSet Int | ISInvalid deriving Show
@@ -57,7 +58,7 @@ data LimeExpr =
     | Prefix LimeOp LimeNode
     | FunCall LimeNode LimeNode
     | Lambda [LimeNode] LimeNode
-    | Let LimeNode LimeNode
+    | Let LimeNode LimeNode LimeNode
     -- name tvars members
     | Data Text [Text] [(Text, [LimeNode])]
     -- value cases
@@ -121,7 +122,9 @@ limeLet = do
     left <- limeNode
     _ <- symbol "="
     right <- limeNode
-    pure $ Let left right
+    _ <- symbol "in"
+    expr <- limeNode
+    pure $ Let left right expr
 
 limeData :: Parser LimeExpr
 limeData = do
@@ -302,8 +305,8 @@ simplifyLime n@(LimeNode node pos _) = case node of
     List _ -> n
     Prefix op r ->
         n { expr = Prefix op $ simplifyLime r }
-    Let l r ->
-        n { expr = Let (simplifyLime l) (simplifyLime r) }
+    Let l r e ->
+        n { expr = Let (simplifyLime l) (simplifyLime r) (simplifyLime e) }
     Data _ _ _ -> n
     Case v cs ->
         n { expr = Case (simplifyLime v) ((\(a,b) -> (a, simplifyLime b)) <$> cs) }
@@ -333,7 +336,7 @@ printNode n@(LimeNode node _ _) = case node of
     Case v cs -> "case " <> printNode v <> " of\n    " <> (T.intercalate "\n    " $ map (\(l, r) -> printNode l <> " -> " <> printNode r) cs)
     Prefix op r ->
         ""
-    Let l r ->
+    Let l r e ->
         ""
     Discard -> "_"
 
@@ -557,7 +560,7 @@ typecheckPatternMatch :: TypeEnv -> LimeNode -> Typechecker (TypeEnv, LimeNode)
 typecheckPatternMatch env n@(LimeNode node npos _) = case node of
     Int _ -> pure $ (env, n { info = defInt })
     Symbol s -> 
-        (\v -> (env, n { info = v })) <$> findVarError env s npos
+        findVarError env s npos <&> (\v -> (env, n { info = v }))
     FunCall f (LimeNode a _ _) -> do
         (env'@(tenv, venv), f') <- typecheckPatternMatch env f 
         case info f' of
@@ -621,6 +624,16 @@ typecheck env n@(LimeNode node npos _) = case node of
         -- this is crucial so that the type of v' can be determined
         let v'' = v' { info = apply s2 $ info v' }
         pure $ (s2, n { expr = Case v'' cs', info = info $ snd $ head cs'})
+    Let l@(LimeNode (Symbol a) _ _) r e -> do
+        -- TODO change typecheckPatternMatch so that using just a symbol works
+        -- (env', l') <- typecheckPatternMatch env l
+        (s1, r') <- typecheck env r
+        let t'    = generalize env' $ getType r'
+            (tenv, venv)  = (applyEnv s1 env)
+            env' = (tenv, Map.insert a t' venv) 
+        (s2, e') <- typecheck env' e
+
+        pure $ (Map.union s1 s2, n { expr = Let (l { info = info r' }) r' e', info = info e' })
     Int _ -> pure $ (Map.empty, n { info = defInt })
 
     -- catch all so the darn language server doesn't complain
@@ -744,6 +757,7 @@ data Value
 data Instruction
     = IApply
     | IConst Value
+    | IBlock LimeType [Instruction]
     | IGetVal Text
     | IGetFunc Int
     | IDup
@@ -789,7 +803,6 @@ linearize n@(LimeNode node npos ninfo) = case node of
     Lambda [ln@(LimeNode (Symbol a) _ ainfo)] r@(LimeNode _ _ rinfo) -> do
         r' <- linearize r 
         pure [IConst $ VFunc (a, ainfo, rinfo) r']
-    Int v -> pure [IConst $ VInt v]
     Case v@(LimeNode _ _ vinfo) cs -> do
         v' <- linearize v
         cs' <- traverse (\(l,r) -> do
@@ -800,6 +813,11 @@ linearize n@(LimeNode node npos ninfo) = case node of
                 TADT _ _ _ -> [IDup, IGetVal "_adtType", IApply]
                 _ -> []
         pure $ v' <> adtStuff <> [ISwitch ninfo cs']
+    Let l@(LimeNode (Symbol a) _ _) r e -> do
+        r' <- linearize r
+        e' <- linearize e
+        pure $ [IBlock (info e) (r' <> [ISetVal a] <> e')]
+    Int v -> pure [IConst $ VInt v]
     _ -> error $ T.unpack $ printNode n
 
     -- catch all so the darn language server doesn't complain
@@ -869,6 +887,16 @@ linearizedToGo = \case
         r <- pushStack
         v' <- valueToGo v
         pure $ r <> " := " <> v'
+    IBlock t is -> do
+        ret <- gets _counter
+        counter %= (+1)
+        is' <- (T.intercalate "\n    " <$> (traverse linearizedToGo is))
+        s <- gets _stack
+        -- retrieve last value from block
+        v <- popStack
+        -- push return value onto stack
+        stack %= (ret:)
+        pure $ "var " <> toCVar ret <> " " <> printTypeGo t <> "\n    {\n    " <> is' <> "\n    " <> toCVar ret <> " = " <> v <> "\n    }"
     IGetVal v -> do
         r <- pushStack
         rs <- gets _recs
@@ -920,6 +948,7 @@ functionToGo name is t tname = evalState f (GoBackendData [] 0 (Map.singleton tn
             let header = "func _fn" <> T.pack (show name) <> "() " <> printTypeGo t <> " {\n    "
             v <- T.intercalate "\n    " <$> (traverse linearizedToGo is)
             r <- popStack
+            _ <- (assert . null) <$> gets _stack
             pure $ header <> v <> "\n    return " <> r <> ";\n}\n\n" <> nameDef
           nameDef = "var _" <> tname <> " = _fn" <> T.pack (show name) <> "()"
 
@@ -1047,11 +1076,12 @@ monomorphize env n@(LimeNode node _ ninfo) = case node of
     Prefix op r -> do
         r' <- monomorphize env r
         pure n { expr = Prefix op r' }
-    Let l r -> do
+    Let l r e -> do
         -- doesn't work yet because needs pattern matching
         l' <- monomorphize env l
         r' <- monomorphize env r
-        pure n { expr = Let l' r' }
+        e' <- monomorphize env e
+        pure n { expr = Let l' r' e' }
     Case v cs -> do
         v' <- monomorphize env v
         cs' <- traverse (\(a, b) -> monomorphize env b >>= pure . (a,)) cs
@@ -1118,6 +1148,7 @@ printInstruction :: Int -> Instruction -> Text
 printInstruction i inst = T.replicate i " " <> case inst of
     IApply -> "IApply"
     IConst v -> "IConst " <> printValue i v
+    IBlock _ is -> "IBlock\n" <> (T.intercalate "\n" $ map (printInstruction (i+4)) is)
     IGetVal v -> "IGetVal " <> v
     IDup -> "IDup"
     IDrop -> "IDrop"
@@ -1167,7 +1198,6 @@ main = do
 
     T.putStrLn $ printTypeEnv $ fst env
     T.putStrLn $ printTypeEnv $ snd env
-
 
     case mappedNodes !? "main" of
         Nothing -> putStrLn "ERROR: no main function found"

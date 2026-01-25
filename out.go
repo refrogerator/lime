@@ -49,72 +49,23 @@ func __index[A any](a []A) func(int) A {
 	}
 }
 
-var _cniCons = 0
-type _cnsCons struct {
-    _0 int
-    _1 ADT
-}
-var _cnvCons = func (_0 int) func (ADT) ADT {
-    return func (_1 ADT) ADT {
-    return ADT{_cniCons,_cnsCons{_0,_1}}}}
-var _cniNil = 1
-var _cnvNil = ADT{_cniNil,nil}
-
 func _fn0() int {
-    _0 := _cnvNil
-    _1 := 3
-    _2 := _cnvCons
-    _3 := _2(_1)
-    _4 := _3(_0)
-    _5 := 2
-    _6 := _cnvCons
-    _7 := _6(_5)
-    _8 := _7(_4)
-    _9 := 1
-    _10 := _cnvCons
-    _11 := _10(_9)
-    _12 := _11(_8)
-    _13 := _funny
-    _14 := _13(_12)
-    return _14;
+    var _0 int
+    {
+    _1 := 4
+    _a := _1
+    _2 := 5
+    _3 := _a
+    _4 := ___add
+    _5 := _4(_3)
+    _6 := _5(_2)
+    _0 = _6
+    }
+    _7 := 2
+    _8 := ___add
+    _9 := _8(_7)
+    _10 := _9(_0)
+    return _10;
 }
 
 var __lmmain = _fn0()
-
-func _fn1() func (ADT) int {
-    _0 := func (_n ADT) int {
-    _1 := _n
-    
-    _2 := __adtType
-    _3 := _2(_1)
-    var _4 int
-    switch (_3) {
-    case _cniNil:
-    
-    
-    _5 := 0
-    _4 = _5
-    case _cniCons:
-    
-    
-    _6 := _1.v.(_cnsCons)._0
-    _i := _6
-    
-    _7 := _1.v.(_cnsCons)._1
-    _l := _7
-    
-    _8 := _l
-    _9 := _fn1()
-    _10 := _9(_8)
-    _11 := _i
-    _12 := ___add
-    _13 := _12(_11)
-    _14 := _13(_10)
-    _4 = _14
-    }
-    return _4
-    }
-    return _0;
-}
-
-var _funny = _fn1()

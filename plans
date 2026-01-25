@@ -7,3 +7,6 @@
 - constraint generation -> constraint solving
 - proper name mangling
 - closure conversion
+- fix parser (comments right after an AssignValue are still parsed as normal code somehow)
+- `let`s
+- typeclasses
