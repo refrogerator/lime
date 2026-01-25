@@ -52,6 +52,11 @@ funny n = case n of
 --
 -- main = (Cons 1 (Cons True (Cons 3 Nil)))
 -- main = funny (Cons (funny1 (Cons 1 Nil)) (Cons 2 (Cons 3 Nil)))
+
+-- ones :: List Int
+-- ones = Cons 1 ones
+
+-- main = funny ones
 main = funny (Cons 1 (Cons 2 (Cons 3 Nil)))
 -- main = Cons 1 Nil
 -- main = 1
@@ -62,6 +67,7 @@ main = funny (Cons 1 (Cons 2 (Cons 3 Nil)))
 -- main :: Int
 -- main = True 4
 -- main = Test False 20
+-- main = const 1 (const 2 3)
 -- main = const 1 2
 
 -- id :: a -> a

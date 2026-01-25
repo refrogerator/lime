@@ -5,3 +5,5 @@
 - out of order declaration
 - function node with multiple arguments for easier typechecking
 - constraint generation -> constraint solving
+- proper name mangling
+- closure conversion
