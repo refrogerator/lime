@@ -50,27 +50,25 @@ func __index[A any](a []A) func(int) A {
 }
 
 func _fn0() int {
-    var _0 int
-    {
-    _1 := func (_b int) int {
-    _2 := _b
-    _3 := 4
-    _4 := ___add
-    _5 := _4(_3)
-    _6 := _5(_2)
-    return _6
-    }
-    _a := _1
-    _7 := 3
-    _8 := _a
-    _9 := _8(_7)
-    _0 = _9
-    }
-    _10 := 2
-    _11 := ___add
-    _12 := _11(_10)
-    _13 := _12(_0)
-    return _13;
+    _0 := 2
+    _1 := 1
+    _2 := _const
+    _3 := _2(_1)
+    _4 := _3(_0)
+    return _4;
 }
 
 var __lmmain = _fn0()
+
+func _fn1() func (int) func (int) int {
+    _0 := func (_a int) func (int) int {
+    _1 := func (_b int) int {
+    _2 := _b
+    return _2
+    }
+    return _1
+    }
+    return _0;
+}
+
+var _const = _fn1()

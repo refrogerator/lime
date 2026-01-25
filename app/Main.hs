@@ -102,7 +102,7 @@ indentGuard = get >>= \case
     ISInvalid -> fancyFailure . Set.singleton $ ErrorFail "invalid indent"
 
 scn :: Parser ()
-scn = sc *> (void (optional (try (void eol *> void (indentGuard)))))
+scn = sc *> (void $ optional $ try (eol *> indentGuard))
 
 lexeme :: Parser a -> Parser a
 lexeme = L.lexeme scn
@@ -111,7 +111,7 @@ symbol :: Text -> Parser Text
 symbol = L.symbol scn
 
 limeSymbol :: Parser LimeExpr
-limeSymbol = Symbol . T.pack <$> lexeme (some (letterChar <|> numberChar <|> char '_'))
+limeSymbol = Symbol . T.pack <$> lexeme (some (letterChar <|> numberChar <|> char '_' <|> char '\''))
 
 limeInt :: Parser LimeExpr
 limeInt = Int . read @Int <$> lexeme (some digitChar)
@@ -119,10 +119,12 @@ limeInt = Int . read @Int <$> lexeme (some digitChar)
 limeLet :: Parser LimeExpr
 limeLet = do
     _ <- symbol "let"
-    left <- limeNode
-    _ <- symbol "="
-    right <- limeNode
-    _ <- symbol "in"
+    l <- get
+    left <- trace (show l) limeNode
+    right <- indentBracket $ do
+        _ <- symbol "="
+        indentBracket limeNode
+    _ <- dbg "poop" $ symbol "in"
     expr <- limeNode
     pure $ Let left right expr
 
@@ -203,6 +205,8 @@ indentBracket p = do
         ISSet a -> ISUnset $ a + 1
         a -> a)
     res <- p
+    put o
+    scn
     -- case o of
     --     ISUnset _ -> put ISInvalid
     --     _ -> put o
