@@ -1,6 +1,7 @@
 package main
 
 import fmt "fmt"
+import runtime "runtime"
 
 type ADT struct {
 	t int
@@ -8,7 +9,10 @@ type ADT struct {
 }
 
 func main() {
-	fmt.Println(__lmmain)
+	__lmmain(World{})
+	var stats runtime.MemStats 
+	runtime.ReadMemStats(&stats)
+	fmt.Println(stats.Mallocs)
 }
 
 func ___add(a int) func (int) int {
@@ -34,6 +38,20 @@ func ___div(a int) func (int) int {
 		return a / b;
 	}
 }
+
+type World struct {}
+type Unit struct {}
+
+var ___world = World{}
+
+func ___printChar(c int) IO {
+	return func (_ World) World {
+		fmt.Printf("%c", c)
+		return ___world
+	}
+}
+
+type IO func (World) World
 
 func __adtType(a ADT) int {
 	return a.t;

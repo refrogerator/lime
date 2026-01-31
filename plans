@@ -1,3 +1,4 @@
+- optimize freeTypeVars
 - intern all typeclasses
 - lists
 - adts with generics
