@@ -68,7 +68,7 @@ data LimeExpr =
     | Case LimeNode [(LimeNode, LimeNode)]
     | Class Text Text [LimeNode]
     | Instance Text Text [LimeNode]
-    | Typedef LimeNode LimeNode
+    | Typedef Text [Text] LimeNode
     | Discard
     -- | DoBlock [LimeNode]
     deriving Show
@@ -179,10 +179,11 @@ limeInstance = do
 limeTypedef :: Parser LimeExpr
 limeTypedef = do
     _ <- symbol "type"
-    l <- limeNode
+    left <- T.pack <$> lexeme (some letterChar)
+    tvs <- many (T.pack <$> lexeme (some letterChar))
     _ <- symbol "="
     r <- typeLevelNode
-    pure $ Typedef l r
+    pure $ Typedef left tvs r
 
 limeData :: Parser LimeExpr
 limeData = do
@@ -384,7 +385,7 @@ simplifyLime n@(LimeNode node pos _) = case node of
         n { expr = Class name tv (map simplifyLime ds) }
     Instance name tv ds ->
         n { expr = Instance name tv (map simplifyLime ds) }
-    Typedef l r -> n
+    Typedef l tvs r -> n
     Discard -> n
 
 printNode :: LimeNode -> Text
@@ -418,8 +419,8 @@ printNode n@(LimeNode node _ _) = case node of
     Instance n t ds ->
         "instance " <> n <> " " <> t <> " where\n    "
             <> (T.intercalate "\n    " (map printNode ds))
-    Typedef l r ->
-        "type " <> printNode l <> " = " <> printNode r
+    Typedef l tvs r ->
+        "type " <> l <> (if null tvs then "" else " " <> T.intercalate " " tvs) <> " = " <> printNode r
     Prefix op r ->
         ""
     Discard -> "_"
@@ -446,28 +447,10 @@ data LimeType =
     | TADT Text [(Text, [LimeType])] [LimeType]
     -- recursive ADT (name, applied types)
     | TRec Text [LimeType]
-    | TNamed Text LimeType
+    | TNamed Text [LimeType] LimeType
     -- no assigned type
     | Unchecked
     deriving (Show, Eq, Ord)
-
-printType :: LimeType -> Text
-printType = \case
-    TLambda a r -> 
-        case a of
-            TLambda _ _ -> "(" <> printType a <> ") -> " <> printType r
-            _ -> printType a <> " -> " <> printType r
-    TPrim p -> case p of
-        PInt _ _ -> "Int" 
-        PFloat _ -> "Float"
-        PString -> "String"
-        PUnit -> "Unit"
-        PWorld -> "World"
-    TVar i cs -> "(" <> (if Set.null cs then "" else (T.intercalate ", " $ Set.elems cs) <> " ") <> "p" <> T.pack (show i) <> ")"
-    TADT n ms ats -> n <> T.concat (map (\at -> " " <> printType at) ats) -- <>  " (" <> T.intercalate " | " (map (\(n', ts) -> n' <> if null ts then "" else " " <> T.intercalate " " (map (\t -> "(" <> printType t <> ")") ts)) ms) <> ")"
-    TRec t ats -> t <> T.concat (map (\at -> " " <> printType at) ats)
-    TNamed t _ -> t
-    Unchecked -> "Unchecked"
 
 data CheckedNode = CheckedNode LimeNode LimeType
     deriving Show
@@ -501,6 +484,24 @@ data TypecheckError
 
 type Typechecker a = ExceptT (Pos, TypecheckError) (State TypecheckerState) a
 
+printType :: LimeType -> Text
+printType = \case
+    TLambda a r -> 
+        case a of
+            TLambda _ _ -> "(" <> printType a <> ") -> " <> printType r
+            _ -> printType a <> " -> " <> printType r
+    TPrim p -> case p of
+        PInt _ _ -> "Int" 
+        PFloat _ -> "Float"
+        PString -> "String"
+        PUnit -> "Unit"
+        PWorld -> "World"
+    TVar i cs -> (if Set.null cs then "" else "(" <> (T.intercalate ", " $ Set.elems cs) <> " ") <> "p" <> T.pack (show i) <> (if Set.null cs then "" else ")")
+    TADT n ms ats -> n <> T.concat (map (\at -> " " <> printType at) ats) -- <>  " (" <> T.intercalate " | " (map (\(n', ts) -> n' <> if null ts then "" else " " <> T.intercalate " " (map (\t -> "(" <> printType t <> ")") ts)) ms) <> ")"
+    TRec t ats -> t <> T.concat (map (\at -> " " <> printType at) ats)
+    TNamed n tvs _ -> n <> (if null tvs then "" else " " <> T.intercalate " " (map printType tvs))
+    Unchecked -> "Unchecked"
+
 instantiate :: Scheme -> Typechecker LimeType
 instantiate (Forall as t) = do
     as' <- mapM (freshTVarWithConstraint . snd) as
@@ -515,7 +516,7 @@ findVarEnv (_, venv) n = case venv !? n of
 findVarError :: TypeEnv -> Text -> Pos -> Typechecker LimeType
 findVarError env n pos = findVarEnv env n >>= \case
     Just a -> pure a
-    Nothing -> throwError (pos, TEVarNotFound n)
+    Nothing -> throwError (pos, trace (T.unpack $ printTypeEnv $ snd env) $ TEVarNotFound n)
 
 findTypeEnv :: TypeEnv -> Text -> Typechecker (Maybe LimeType)
 findTypeEnv (tenv, _) n = case tenv !? n of
@@ -528,23 +529,26 @@ findTypeError env n pos = findTypeEnv env n >>= \case
     Nothing -> throwError (pos, TETypeNotFound n)
 
 typeLevelEval :: TypeEnv -> LimeNode -> Typechecker Scheme
-typeLevelEval env@(tenv, _) n@(LimeNode node pos _) = case node of
+typeLevelEval env n = snd <$> typeLevelEvalI env n
+
+typeLevelEvalI :: TypeEnv -> LimeNode -> Typechecker (TypeEnv, Scheme)
+typeLevelEvalI env@(tenv, _) n@(LimeNode node pos _) = case node of
     Symbol s -> case tenv !? s of
-            Just a -> pure a
+            Just a -> pure (env, a)
             Nothing -> if isUpperCase $ T.head s 
                 then throwError (pos, TETypeNotFound s)
                 -- keep track of created tvars in env
-                else freshTVar >>= \tv@(TVar v c) -> pure $ Forall [(v, c)] tv
+                else freshTVar >>= \tv@(TVar v c) -> pure ((Map.insert s (Forall [] tv) tenv, snd env), Forall [(v, c)] tv)
     Infix FunArrow l r -> do
-        (Forall lvs lt) <- typeLevelEval env l
-        (Forall rvs rt) <- typeLevelEval env r
-        pure $ Forall (lvs <> rvs) $ TLambda lt rt
+        (env', Forall lvs lt) <- typeLevelEvalI env l
+        (env'', Forall rvs rt) <- typeLevelEvalI env' r
+        pure (env'', Forall (lvs <> rvs) $ TLambda lt rt)
     FunCall f a -> do
-        f' <- typeLevelEval env f
-        let (Forall (ftv:ftvs) f'') = f'
-        a' <- typeLevelEval env a
-        b <- bind pos (fst ftv) $ schemeType a'
-        pure (Forall ftvs $ apply b f'')
+        (_, f') <- typeLevelEvalI env f
+        let Forall (ftv:ftvs) f'' = f'
+        (env', Forall ftvs2 a') <- typeLevelEvalI env a
+        b <- bind pos (fst ftv) a'
+        pure (env', Forall (ftvs <> ftvs2) $ apply b f'')
     _ -> throwError (pos, TEUnsupportedTLExpr n)
 
 freshTVarWithConstraint :: Set.Set Text -> Typechecker LimeType
@@ -568,11 +572,23 @@ schemeType (Forall _ t) = t
 getType :: LimeNode -> LimeType
 getType (LimeNode _ _ t) = t
 
+recApply :: Subst -> LimeType -> LimeType
+recApply s t@(TVar v c) = case s !? v of
+    Just x -> recApply s x
+    Nothing -> t
+recApply s (TNamed n tvs t) = TNamed n (map (recApply s) tvs) (recApply s t)
+recApply s (TLambda a r) = TLambda (recApply s a) (recApply s r)
+recApply _ t = t
+
+
 apply :: Subst -> LimeType -> LimeType
-apply s t@(TVar v c) = Map.findWithDefault t v s
+apply s t@(TVar v c) = case s !? v of
+    Just x -> recApply s x
+    Nothing -> t
 apply s (TLambda a r) = TLambda (apply s a) (apply s r)
 apply s (TADT t ms ats) = TADT t (map (\(a, ts) -> (a, map (apply s) ts)) ms) $ map (apply s) ats
 apply s (TRec t ats) = TRec t $ map (apply s) ats
+apply s (TNamed n tvs t) = TNamed n (map (apply s) tvs) (apply s t)
 apply _ t = t
 
 applyS :: Subst -> Scheme -> Scheme
@@ -607,44 +623,45 @@ applyNodesInternal s n@(LimeNode node pos _) = case node of
         n { expr = Let l (applyNodes s r) (applyNodes s e) }
     Data _ _ _ -> n
     Case v cs ->
-        n { expr = Case (applyNodes s v) ((\(a,b) -> (a, applyNodes s b)) <$> cs) }
+        n { expr = Case (applyNodes s v) ((\(a,b) -> (applyNodes s a, applyNodes s b)) <$> cs) }
     Class name tv ds ->
         n { expr = Class name tv (map (applyNodes s) ds) }
     Instance name tv ds ->
         n { expr = Instance name tv (map (applyNodes s) ds) }
-    Typedef l r -> n
+    Typedef l tvs r -> n
     Discard -> n
 
-unifyList :: Pos -> [LimeType] -> [LimeType] -> Typechecker Subst
-unifyList pos as bs = foldl' helper (pure Map.empty) $ zip as bs
+unifyList :: [LimeType] -> [LimeType] -> Typechecker Subst
+unifyList as bs = foldl' helper (pure Map.empty) $ zip as bs
     where helper b (ta,tb) = do
             s1 <- b
-            s2 <- unify pos (apply s1 ta) (apply s1 tb)
+            s2 <- unifyInternal (apply s1 ta) (apply s1 tb)
             pure $ Map.union s2 s1
 
 unify :: Pos -> LimeType -> LimeType -> Typechecker Subst
-unify pos t1 t2 = withError (const (pos, TEMismatch t1 t2)) (unifyInternal pos t1 t2)
+unify pos t1 t2 = withError ((pos,) . snd) (unifyInternal t1 t2)
+-- unify pos t1 t2 = withError (const (pos, TEMismatch t1 t2)) (unifyInternal t1 t2)
 
-unifyInternal :: Pos -> LimeType -> LimeType -> Typechecker Subst
+unifyInternal :: LimeType -> LimeType -> Typechecker Subst
 -- combine constraints between 2 tvars
-unifyInternal pos (TVar a ac) (TVar b bc) = bind pos a (TVar b (Set.union ac bc))
+unifyInternal (TVar a ac) (TVar b bc) = bind defaultSourcePos a (TVar b (Set.union ac bc))
 -- this rule needs to be at the top, so that names are preserved
-unifyInternal pos (TVar a c) t = bind pos a t
-unifyInternal pos t (TVar a c) = bind pos a t
-unifyInternal pos (TNamed _ a) (TNamed _ b) = unifyInternal pos a b
-unifyInternal pos (TNamed _ a) b = unifyInternal pos a b
-unifyInternal pos a (TNamed _ b) = unifyInternal pos a b
-unifyInternal pos (TLambda l1 r1) (TLambda l2 r2) = do
-    s1 <- unifyInternal pos l1 l2
-    s2 <- unifyInternal pos (apply s1 r1) (apply s1 r2)
+unifyInternal (TVar a c) t = bind defaultSourcePos a t
+unifyInternal t (TVar a c) = bind defaultSourcePos a t
+unifyInternal (TNamed _ _ a) (TNamed _ _ b) = unifyInternal a b
+unifyInternal (TNamed _ _ a) b = unifyInternal a b
+unifyInternal a (TNamed _ _ b) = unifyInternal a b
+unifyInternal (TLambda l1 r1) (TLambda l2 r2) = do
+    s1 <- unifyInternal l1 l2
+    s2 <- unifyInternal (apply s1 r1) (apply s1 r2)
     pure $ Map.union s2 s1
 -- TODO see whether there's limits to using nominalism beyond type application
-unifyInternal pos (TRec a ats) (TRec b bts) | a == b = unifyList pos ats bts
-unifyInternal pos (TRec a ats) (TADT b _ bts) | a == b = unifyList pos ats bts
-unifyInternal pos (TADT a _ ats) (TRec b bts) | a == b = unifyList pos ats bts
-unifyInternal pos (TADT a _ ats) (TADT b _ bts) | a == b = unifyList pos ats bts
-unifyInternal _ (TPrim a) (TPrim b) | a == b = pure Map.empty
-unifyInternal pos t1 t2 = throwError $ (pos, TEMismatch t1 t2)
+unifyInternal (TRec a ats) (TRec b bts) | a == b = unifyList ats bts
+unifyInternal (TRec a ats) (TADT b _ bts) | a == b = unifyList ats bts
+unifyInternal (TADT a _ ats) (TRec b bts) | a == b = unifyList ats bts
+unifyInternal (TADT a _ ats) (TADT b _ bts) | a == b = unifyList ats bts
+unifyInternal (TPrim a) (TPrim b) | a == b = pure Map.empty
+unifyInternal t1 t2 = throwError (defaultSourcePos, TEMismatch t1 t2)
 
 occurs :: Int -> LimeType -> Bool
 occurs v = \case
@@ -654,7 +671,7 @@ occurs v = \case
     -- TODO fix occurs check for ADT, TRec, TFun and TApp
     TRec _ _ -> False
     TADT _ _ _ -> False
-    TNamed _ t -> occurs v t
+    TNamed _ _ t -> occurs v t
     Unchecked -> False
 
 bind :: Pos -> Int -> LimeType -> Typechecker Subst
@@ -680,7 +697,7 @@ freeTypeVars = \case
     -- TODO fix tvar check for ADTS once generic
     TRec _ ats -> Set.unions $ map freeTypeVars ats
     TADT _ ms ats -> Set.union (Set.unions $ concatMap (map freeTypeVars . snd) ms) (Set.unions $ map freeTypeVars ats)
-    TNamed _ t -> freeTypeVars t
+    TNamed _ _ t -> freeTypeVars t
     Unchecked -> Set.empty
 
 freeTypeVarsS :: Scheme -> Set.Set (Int, Set.Set Text)
@@ -694,23 +711,33 @@ generalize :: TypeEnv -> LimeType -> Scheme
 generalize env t = Forall as t
     where as = Set.toList $ freeTypeVars t `Set.difference` freeTypeVarsEnv env
 
+data Constraint
+    = CUnified Pos LimeType LimeType
+    deriving Show
+
+resolveConstraints :: [Constraint] -> Typechecker Subst
+resolveConstraints cs = foldl' resolveConstraint (pure Map.empty) cs
+    where resolveConstraint :: Typechecker Subst -> Constraint -> Typechecker Subst
+          resolveConstraint s0 c = case c of
+            CUnified pos t1 t2 -> s0 >>= \s1 -> Map.union s1 <$> unify pos (apply s1 t1) (apply s1 t2)
+
 typecheckPatternMatch :: TypeEnv -> LimeNode -> Typechecker (TypeEnv, LimeNode)
 typecheckPatternMatch env n@(LimeNode node npos _) = case node of
     Int _ -> pure $ (env, n { info = defInt })
     Symbol s -> 
-        findVarError env s npos <&> (\v -> (env, n { info = v }))
-    FunCall f (LimeNode a _ _) -> do
+        findVarError env s npos <&> 
+            \v -> (env, n { info = v })
+    FunCall f an@(LimeNode a _ _) -> do
         (env'@(tenv, venv), f') <- typecheckPatternMatch env f 
         case info f' of
             TLambda arg ret ->
                 case a of
                     Symbol s ->
-                        pure ((tenv, Map.insert s (Forall [] arg) venv), n { info = ret })
+                        pure ((tenv, Map.insert s (Forall [] arg) venv), n { expr = FunCall f' an, info = ret })
                     Discard ->
-                        pure (env', n { info = ret })
+                        pure (env', n { expr = FunCall f' an, info = ret })
                     _ -> throwError (npos, TEUnsupportedPMExpr n)
             _ -> throwError (npos, TENonFN)
-
             -- Nothing -> pure $ (tenv, Map.insert s t' venv)
     _ -> throwError (npos, TEUnsupportedPMExpr n)
 
@@ -724,7 +751,7 @@ typecheck env n@(LimeNode node npos _) = case node of
 
         let env' = (fst env, Map.insert a (Forall [] tv) $ snd env)
         (s1, r'@(LimeNode _ _ t1)) <- typecheck env' r
-        
+
         pure (s1, n { expr = Lambda [l { info = (apply s1 tv) }] r', info = apply s1 (TLambda tv t1) })
     FunCall f a -> do
         tv <- freshTVar
@@ -783,26 +810,30 @@ topLevelTypecheck :: TypeEnv -> LimeNode -> Typechecker (TypeEnv, LimeNode)
 topLevelTypecheck env@(tenv, venv) n@(LimeNode expr pos _) = case expr of
     Infix AssignType l@(LimeNode (Symbol s) _ _) r -> do
         rt <- typeLevelEval env r
-        curTVar .= 0
         pure $ ((tenv, Map.insert s rt venv), n)
     Infix AssignValue a@(LimeNode (Symbol s) _ _) b -> do
-        -- tv <- freshTVar
-        -- -- TODO IMPORTANT add proper recursiveness checking
-        -- (s1, b') <- typecheck (tenv, Map.insert s (Forall [] tv) venv) b
-        (s1, b') <- typecheck env b
-        let env'  = applyEnv s1 env
-            t'    = generalize env' $ getType b'
-        (env'', b'') <- case venv !? s of
-            Just x -> unify pos (schemeType x) (schemeType t') >>= \s2 -> do
-                let env'' = trace (show s2) $ applyEnv s2 env'
-                pure (env'', applyNodes s2 b')
-            Nothing -> pure $ ((fst env', Map.insert s t' $ snd env'), b')
-        curTVar .= 0
+        tv <- freshTVar
+        (s0, b') <- typecheck env b
+        s1 <- Map.union s0 <$> case venv !? s of
+                Just x -> unify pos (schemeType x) (info b')
+                Nothing -> pure Map.empty
+
+        let b''   = trace (show s1) $ applyNodes s1 b'
+            env'  = applyEnv s1 env
+            t'    = generalize env' $ getType b''
+            env'' = case venv !? s of
+                Just _ -> env
+                Nothing -> (fst env', Map.insert s t' $ snd env')
+
         pure $ (env'', n { expr = Infix AssignValue a b'', info = getType b'' })
-    Typedef l@(LimeNode (Symbol s) _ _) r -> do
-        (Forall tvs rt) <- typeLevelEval env r
-        curTVar .= 0
-        pure $ ((Map.insert s (Forall tvs $ TNamed s rt) tenv, venv), n)
+        -- pure $ (tenv, Map.insert s b' venv)
+    Typedef s tvns r -> do
+        tvsi <- traverse (const freshTVarI) tvns
+        let tvs = map (\tvi -> TVar tvi Set.empty) tvsi
+        let env' = foldl' (\m (n, tv@(TVar i _)) -> (Map.insert n (Forall [] tv) $ fst m, snd m)) env $ zip tvns tvs
+        -- TODO forbid inline TV def
+        (Forall tvs2 rt) <- typeLevelEval env' r
+        pure $ ((Map.insert s (Forall ((, Set.empty) <$> tvsi) $ TNamed s tvs rt) tenv, venv), n)
     Data name tvs ms -> do
         tvs' <- traverse (const $ freshTVarI <&> (, Set.empty)) tvs
         let tvs'' = map (\(tvi, _) -> TVar tvi Set.empty) tvs'
@@ -839,9 +870,9 @@ topLevelTypecheck env@(tenv, venv) n@(LimeNode expr pos _) = case expr of
                         pure (applyEnv s1 env', Map.insert (s, trace (T.unpack $ printType $ info r') $ info r') r' is, r':ds')
                     _ -> b
         (env', is, ds') <- foldl' collectImplementations (pure (env, Map.empty, [])) ds
-        
+
         implementations %= Map.union is
-        
+
         -- TODO check all members of the typeclass have been implemented
         instances %= Map.alter (Just . \case
             Just s -> Set.insert t s
@@ -849,14 +880,157 @@ topLevelTypecheck env@(tenv, venv) n@(LimeNode expr pos _) = case expr of
         pure (env', n { expr = Instance name t ds' })
     _ -> (\(_, b) -> (env, b)) <$> typecheck env n
 
+-- typecheck :: TypeEnv -> LimeNode -> Typechecker ([Constraint], LimeNode)
+-- typecheck env n@(LimeNode node npos _) = case node of
+--     Symbol s -> do
+--         (\v -> ([], n { info = v })) <$> findVarError env s npos
+--
+--     Lambda [l@(LimeNode (Symbol a) _ _)] r@(LimeNode _ _ _) -> do
+--         tv <- freshTVar
+--         let env' = (fst env, Map.insert a (Forall [] tv) $ snd env)
+--         (s1, r'@(LimeNode _ _ t1)) <- typecheck env' r
+--         pure (s1, n { expr = Lambda [l { info = tv }] r', info = TLambda tv t1 })
+--
+--     FunCall f a -> do
+--         tv <- freshTVar
+--         (s1, f') <- typecheck env f
+--         (s2, a') <- typecheck env a
+--         let s3 = [CUnified npos (getType f') (TLambda (getType a') tv)]
+--         pure (s1 <> s2 <> s3, n { expr = FunCall f' a', info = tv })
+--
+--     Case v cs -> do
+--         (s1, v') <- typecheck env v 
+--         -- unify left side with v1
+--         -- unify right side with the other right sides
+--         -- correct that later on when i have more complex case statements
+--         let check (l, r) b = do
+--                 (so, cs') <- b
+--                 (env', l') <- typecheckPatternMatch env l
+--                 (s2, r') <- typecheck env' r
+--                 let s3 = s1 <> s2 <> 
+--                         [CUnified (pos l) (info v') (info l')] <> 
+--                         case cs' of
+--                             (c:_) -> [ CUnified (pos r) (info $ snd c) (info r')
+--                                      -- dunno if i even need this but i'm keeping it 4 now
+--                                      , CUnified (pos l) (info $ fst c) (info l') ]
+--                             [] -> []
+--                 pure (so <> s3, (l', r'):cs')
+--         -- TODO don't reverse the list
+--         (s2, cs') <- foldr check (pure (s1, [])) cs
+--         pure $ (s2, n { expr = Case v' cs', info = info $ snd $ head cs'})
+--     Let l@(LimeNode (Symbol a) _ _) r e -> do
+--         -- TODO change typecheckPatternMatch so that using just a symbol works
+--         -- (env', l') <- typecheckPatternMatch env l
+--         (s1, r') <- typecheck env r
+--         let t'    = generalize env' $ getType r'
+--             (tenv, venv)  = env
+--             env' = (tenv, Map.insert a t' venv) 
+--         (s2, e') <- typecheck env' e
+--
+--         pure $ (s1 <> s2, n { expr = Let (l { info = info r' }) r' e', info = info e' })
+--     Int _ -> pure $ ([], n { info = defInt })
+--     Char _ -> pure $ ([], n { info = defChar })
+--     -- catch all so the darn language server doesn't complain
+--     _ -> throwError (npos, TEUnsupportedExpr n)
+--
+-- topLevelTypecheck :: TypeEnv -> LimeNode -> Typechecker (TypeEnv, LimeNode)
+-- topLevelTypecheck env@(tenv, venv) n@(LimeNode expr pos _) = case expr of
+--     Infix AssignType l@(LimeNode (Symbol s) _ _) r -> do
+--         rt <- typeLevelEval env r
+--         pure $ ((tenv, Map.insert s rt venv), n)
+--
+--     Infix AssignValue a@(LimeNode (Symbol s) _ _) b -> do
+--         tv <- freshTVar
+--         (bcs, b') <- trace (show tv) $ typecheck env b
+--         let bcs' = bcs <> case venv !? s of
+--                 Just x -> [CUnified pos (schemeType x) (info b')]
+--                 Nothing -> []
+--
+--         s0 <- resolveConstraints bcs
+--         let b''   = applyNodes s0 b'
+--             env'  = applyEnv s0 env
+--             t'    = generalize env' $ getType b''
+--
+--         pure $ ((fst env', Map.insert s t' $ snd env'), n { expr = Infix AssignValue a b'', info = getType b'' })
+--         -- pure $ (tenv, Map.insert s b' venv)
+--
+--     Typedef s tvns r -> do
+--         tvsi <- traverse (const freshTVarI) tvns
+--         let tvs = map (\tvi -> TVar tvi Set.empty) tvsi
+--         let env' = foldl' (\m (n, tv@(TVar i _)) -> (Map.insert n (Forall [] tv) $ fst m, snd m)) env $ zip tvns tvs
+--         -- TODO forbid inline TV def
+--         (Forall tvs2 rt) <- typeLevelEval env' r
+--         pure $ ((Map.insert s (Forall ((, Set.empty) <$> tvsi) $ TNamed s tvs rt) tenv, venv), n)
+--
+--     Data name tvs ms -> do
+--         tvs' <- traverse (const $ freshTVarI <&> (, Set.empty)) tvs
+--         let tvs'' = map (\(tvi, _) -> TVar tvi Set.empty) tvs'
+--             tempEnv = foldl' insertTVs (Map.insert name (Forall tvs' (TRec name tvs'')) tenv, venv) $ zip tvs tvs''
+--             insertTVs (tenv, venv) (n,v) = (Map.insert n (Forall [] v) tenv, venv)
+--         ms' <- mapM (\(a, b) -> mapM (\x -> schemeType <$> typeLevelEval tempEnv x) b >>= pure . (a,)) ms
+--         let t = TADT name ms' tvs''
+--             env' = (Map.insert name (Forall tvs' t) tenv, venv)
+--             env'' = foldl' (\b (a, cs) -> (fst b, Map.insert a (Forall tvs' (foldl' (\t ti -> TLambda ti t) t $ reverse cs)) $ snd b)) env' ms'
+--
+--         pure $ (env'', n { info = t })
+--
+--     Class name tvn ds -> do
+--         tvi <- freshTVarI
+--         let tv = TVar tvi $ Set.singleton name
+--         let env' = (Map.insert tvn (Forall [(tvi, Set.singleton name)] tv) $ fst env, snd env)
+--         let check (dn@(LimeNode d _ _)) b = do
+--                 case d of
+--                     Infix AssignType l@(LimeNode (Symbol s) _ _) r -> do
+--                         ds' <- b
+--                         r' <- typeLevelEval env' r
+--                         pure (Map.insert s r' $ fst ds', dn { info = schemeType r' }:(snd ds'))
+--                     _ -> b
+--         ds' <- foldr check (pure (Map.empty, [])) ds
+--         classes %= Map.insert name (Map.map schemeType (fst ds'))
+--
+--
+--         pure $ ((fst env, Map.union (fst ds') $ snd env), n { expr = Class name tvn $ snd ds' })
+--     Instance name t ds -> do
+--         let collectImplementations b (dn@(LimeNode d _ _)) = do
+--                 case d of
+--                     Infix AssignValue l@(LimeNode (Symbol s) _ _) r -> do
+--                         (env', is, ds') <- b
+--                         -- TODO do i need these to be interdependent
+--                         (rcs, r') <- typecheck env' r
+--
+--                         -- TODO unify with original type
+--                         s0 <- resolveConstraints rcs
+--                         let r''   = applyNodes s0 r'
+--                         -- TODO unify with original type after applying tvar 0
+--                         -- instead of info r' insert type of TVar 0 (somehow)
+--                         pure (applyEnv s0 env', Map.insert (s, trace (T.unpack $ printType $ info r'') $ info r'') r'' is, r'':ds')
+--                     _ -> b
+--         (env', is, ds') <- foldl' collectImplementations (pure (env, Map.empty, [])) ds
+--
+--         implementations %= Map.union is
+--
+--         -- TODO check all members of the typeclass have been implemented
+--         instances %= Map.alter (Just . \case
+--             Just s -> Set.insert t s
+--             Nothing -> Set.singleton t) name
+--
+--
+--         pure (env', n { expr = Instance name t ds' })
+--     -- TODO fix
+--     _ -> (\(_, b) -> (env, b)) <$> typecheck env n
+--     -- _ -> typecheck env n $> (env, n)
+
 infixType :: LimeType -> LimeType
 infixType t = TLambda t $ TLambda t t
 
 defInt :: LimeType
-defInt = TNamed "Int" $ TPrim $ PInt 0 True
+defInt = TNamed "Int" [] $ TPrim $ PInt 0 True
 
 defChar :: LimeType
-defChar = TNamed "Char" $ TPrim $ PInt 1 True
+defChar = TNamed "Char" [] $ TPrim $ PInt 1 True
+
+defFloat :: LimeType
+defFloat = TNamed "Float" [] $ TPrim $ PFloat 4
 
 defUnit :: LimeType
 defUnit = TPrim $ PUnit
@@ -864,18 +1038,24 @@ defUnit = TPrim $ PUnit
 defWorld :: LimeType
 defWorld = TPrim $ PWorld
 
-defIO :: LimeType
-defIO = TLambda defWorld defWorld
+defIOHelper :: LimeType -> LimeType
+defIOHelper t = TADT "IOHelper" [("IOHelper", [defWorld, t])] [t]
+
+defIO :: LimeType -> LimeType
+defIO t = TNamed "IO" [t] $ TLambda defWorld $ defIOHelper t
+
+defTV :: Int -> LimeType
+defTV i = TVar i Set.empty
 
 defaultTypes :: [(Text, Scheme)]
 defaultTypes = 
     [ ("Int", Forall [] defInt),
       ("Char", Forall [] defChar),
-      ("Float", Forall [] $ TNamed "Float" $ TPrim $ PFloat 4),
+      ("Float", Forall [] defFloat),
       ("Unit", Forall [] defUnit),
-      ("World", Forall [] defWorld),
-      ("IO", Forall [] defIO)
-      -- ("IO", Forall [(0, Set.empty)] $ TADT "IO" [("", [TVar 0 Set.empty])] [TVar 0 Set.empty])
+      ("World", Forall [] defWorld)
+      -- ("IOHelper", Forall [(0, Set.empty)] $ defIOHelper $ defTV 0),
+      -- ("IO", Forall [(0, Set.empty)] $ defIO $ defTV 0)
     ]
 
 builtinFunctions :: Map Text Scheme
@@ -883,15 +1063,16 @@ builtinFunctions = Map.fromList
     [ ("__add", Forall [] $ infixType defInt),
       ("__sub", Forall [] $ infixType defInt),
       ("__mul", Forall [] $ infixType defInt),
-      ("__div", Forall [] $ infixType defInt),
-      ("__world", Forall [] $ defWorld),
-      ("__sequence", Forall [] $ infixType defIO),
-      ("__printChar", Forall [] $ TLambda defChar defIO)
+      ("__div", Forall [] $ infixType defInt)
+      -- ("__printChar", Forall [] $ TLambda defChar $ defIO $ defUnit)
+        -- bind :: IO a -> (a -> IO b) -> IO b
+      -- ("IOHelper", Forall [(0, Set.empty)] $ TLambda defWorld $ TLambda (defTV 0) (defIOHelper $ defTV 0)),
+      -- ("bind", Forall [(0, Set.empty), (1, Set.empty)] $ TLambda (defIO $ defTV 0) $ TLambda (TLambda (defTV 0) (defIO $ defTV 1)) $ defIO $ defTV 1),
+      -- ("pure", Forall [(0, Set.empty)] $ TLambda (defTV 0) $ defIO $ defTV 0)
     ]
 
 defaultValues :: Map Text Scheme
-defaultValues =
-    builtinFunctions
+defaultValues = builtinFunctions
 
 defaultTypeEnv :: TypeEnv
 defaultTypeEnv = (Map.fromList defaultTypes, defaultValues)
@@ -899,6 +1080,7 @@ defaultTypeEnv = (Map.fromList defaultTypes, defaultValues)
 typecheckAllI :: [LimeNode] -> TypeEnv -> Typechecker (TypeEnv, [LimeNode])
 typecheckAllI [] env = pure (env, [])
 typecheckAllI (n:ns) env = do
+    curTVar .= 0
     (env', n') <- topLevelTypecheck env n
     (env'', n2) <- typecheckAllI ns env'
     pure $ (env'', n':n2)
@@ -941,7 +1123,7 @@ printTypeGo = \case
         PWorld -> "World"
     TADT _ _ _ -> "ADT"
     TRec _ _ -> "ADT"
-    TNamed _ t -> printTypeGo t
+    TNamed _ _ t -> printTypeGo t
     Unchecked -> "Unchecked"
 
 printTypeEnv :: Map Text Scheme -> Text
@@ -1233,12 +1415,19 @@ makeLenses ''MonomorphizerState
 
 type Monomorphizer = State MonomorphizerState
 
+mUnifyList :: [LimeType] -> [LimeType] -> Map Int LimeType
+mUnifyList as bs = foldl' helper Map.empty $ zip as bs
+    where helper s1 (ta,tb) =
+            let s2 = mUnify (apply s1 ta) (apply s1 tb)
+            in Map.union s2 s1
+
 mUnify :: LimeType -> LimeType -> Map Int LimeType
 mUnify (TVar a _) b = Map.singleton a b
 mUnify a (TVar b _) = Map.singleton b a
 mUnify (TLambda l1 r1) (TLambda l2 r2) = let s1 = mUnify l1 l2 in Map.union s1 (mUnify (apply s1 r1) (apply s1 r2))
-mUnify a (TNamed _ b) = mUnify a b
-mUnify (TNamed _ a) b = mUnify a b
+mUnify (TADT a _ ats) (TADT b _ bts) = mUnifyList ats bts
+mUnify a (TNamed _ _ b) = mUnify a b
+mUnify (TNamed _ _ a) b = mUnify a b
 mUnify a b = Map.empty
 
 monomorphizeFunCall :: LimeNode -> Map Int LimeType -> Monomorphizer (LimeNode, Maybe FType, LimeType, Map Int LimeType)
@@ -1247,6 +1436,7 @@ monomorphizeFunCall n@(LimeNode node _ ninfo') env = let ninfo = apply env ninfo
         (f', n', ft, fnEnv) <- monomorphizeFunCall f env
         a' <- monomorphize env a
 
+        -- let f la lr = trace (show fnEnv') $ pure $ (n { expr = FunCall f' a' }, n', lr, fnEnv')
         let f la lr = pure $ (n { expr = FunCall f' a' }, n', lr, fnEnv')
                 where fnEnv' = Map.union (mUnify la (info a)) fnEnv
                 -- where fnEnv' = trace ((T.unpack $ printType la) <> " <-> " <> (T.unpack $ printType $ info a')) Map.union (mUnify la (info a)) fnEnv
@@ -1280,6 +1470,22 @@ monomorphizeFunCall n@(LimeNode node _ ninfo') env = let ninfo = apply env ninfo
                 --     Nothing -> error $ "could not find function " <> T.unpack s <> " in env"
     _ -> monomorphize env n >>= \n' -> pure (n', Nothing, ninfo, Map.empty)
 
+monomorphizePMCase :: Map Int LimeType -> Int -> LimeNode -> Monomorphizer ()
+monomorphizePMCase env i n@(LimeNode node pos ninfo) = case node of
+    FunCall f (LimeNode a _ _) -> monomorphizePMCase env (i+1) f
+    Symbol s -> do
+        v <- gets _mFunctions
+        case v !? s of
+            Just mf -> trace (T.unpack s <> show mf) $ case mf of
+                FTCon c -> reqTypes %= Set.insert (c, getRet i $ apply env ninfo)
+                    where getRet i t = if i > 0 then case t of
+                            TLambda _ r -> getRet (i-1) r
+                            _ -> error "don't do"
+                            else t
+                _ -> pure ()
+            _ -> pure ()
+    _ -> pure ()
+
 monomorphize :: Map Int LimeType -> LimeNode -> Monomorphizer LimeNode
 monomorphize env n@(LimeNode node npos ninfo) = case node of
     FunCall f a -> do
@@ -1297,7 +1503,7 @@ monomorphize env n@(LimeNode node npos ninfo) = case node of
                     impls <- gets _mImplementations
                     case impls !? (name, finfo) of
                         -- TODO monomorphize class instances
-                        Just f -> monomorphizedFns %= Map.insert (name, finfo) (n { expr = Infix AssignValue (LimeNode (Symbol name) npos finfo) f, info = finfo })
+                        Just f -> trace (T.unpack $ printType finfo) $ monomorphizedFns %= Map.insert (name, finfo) (n { expr = Infix AssignValue (LimeNode (Symbol name) npos finfo) f, info = finfo })
                         Nothing -> error "impossible"
             Nothing -> pure ()
         pure $ n' { info = apply env ninfo }    
@@ -1324,13 +1530,13 @@ monomorphize env n@(LimeNode node npos ninfo) = case node of
         -- TODO monomorphize lets
         -- doesn't work yet because needs pattern matching
         -- l' <- monomorphize env l
-        -- r' <- monomorphize env r
-        -- e' <- monomorphize env e
-        -- pure n { expr = Let l' r' e' }
-        pure n
+        r' <- monomorphize env r
+        e' <- monomorphize env e
+        pure n { expr = Let l r' e' }
+        -- pure n
     Case v cs -> do
         v' <- monomorphize env v
-        cs' <- traverse (\(a, b) -> monomorphize env b >>= pure . (a,)) cs
+        cs' <- traverse (\(a, b) -> (a,) <$> (monomorphize env b) <* (monomorphizePMCase env 0 a)) cs
         pure n { expr = Case v' cs', info = apply env ninfo }
     Discard -> pure n
     Int _ -> pure n
@@ -1343,6 +1549,7 @@ monomorphizeFnTL :: LimeNode -> Map Int LimeType -> Monomorphizer ()
 monomorphizeFnTL n@(LimeNode node _ ninfo) env = case node of
     Infix AssignValue l@(LimeNode (Symbol s) _ _) r -> do
         exists <- gets (\t -> (s, apply env ninfo) `Map.member` _monomorphizedFns t)
+        -- if trace (T.unpack s <> "\n" <> T.unpack (printTypeEnv $ Map.mapKeys (T.pack . show) $ Map.map (Forall []) env)) exists
         if exists
         then pure ()
         else do
@@ -1422,7 +1629,7 @@ generateTypeName = \case
         PWorld -> "_World"
     -- add type applications to the end
     TADT n _ _ -> "_" <> n
-    TNamed n _ -> "_" <> n
+    TNamed n _ _ -> "_" <> n
     Unchecked -> "Unchecked"
 
 collectConstructors :: [LimeType] -> [(Text, FType)]
@@ -1454,6 +1661,7 @@ main = do
 
     T.putStrLn $ printTypeEnv $ fst env
     T.putStrLn $ printTypeEnv $ snd env
+    T.putStrLn "joue"
 
     case mappedNodes !? "main" of
         Nothing -> putStrLn "ERROR: no main function found"
@@ -1467,6 +1675,7 @@ main = do
                 let newFunctions = map (\(n,b,c) -> if n == "main" then ("_lmmain",b,c) else (n,b,c)) $ _functions s
                 T.putStrLn $ T.intercalate "\n" (map (\(a,b,_) -> a <> " :: " <> printType b) mfns)
                 T.putStrLn ""
+                -- print $ envFns
                 -- print $ mfns
                 print $ rtypes
                 T.putStrLn ""

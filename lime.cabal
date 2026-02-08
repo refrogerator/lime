@@ -81,6 +81,7 @@ executable lime
         , containers
         , process
         , vector
+        , union-find
 
     -- Directories containing source files.
     hs-source-dirs:   app

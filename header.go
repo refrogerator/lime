@@ -42,27 +42,9 @@ func ___div(a int) func (int) int {
 type World struct {}
 type Unit struct {}
 
-var ___world = World{}
-
-func ___printChar(c int) IO {
-	return func (_ World) World {
+func ___printChar(c int) func (World) Unit {
+	return func (_ World) Unit {
 		fmt.Printf("%c", c)
-		return ___world
-	}
-}
-
-type IO func (World) World
-
-func __adtType(a ADT) int {
-	return a.t;
-}
-
-func __adtValue(a ADT) interface{} {
-	return a.v;
-}
-
-func __index[A any](a []A) func(int) A {
-	return func (i int) A {
-		return a[i]
+		return Unit{}
 	}
 }

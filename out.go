@@ -42,28 +42,10 @@ func ___div(a int) func (int) int {
 type World struct {}
 type Unit struct {}
 
-var ___world = World{}
-
-func ___printChar(c int) IO {
-	return func (_ World) World {
+func ___printChar(c int) func (World) Unit {
+	return func (_ World) Unit {
 		fmt.Printf("%c", c)
-		return ___world
-	}
-}
-
-type IO func (World) World
-
-func __adtType(a ADT) int {
-	return a.t;
-}
-
-func __adtValue(a ADT) interface{} {
-	return a.v;
-}
-
-func __index[A any](a []A) func(int) A {
-	return func (i int) A {
-		return a[i]
+		return Unit{}
 	}
 }
 
@@ -71,6 +53,15 @@ var _cniTrue = 0
 var _cnvTrue = ADT{_cniTrue,nil}
 var _cniFalse = 1
 var _cnvFalse = ADT{_cniFalse,nil}
+
+var _cniIOHelper = 0
+type _cnsIOHelper struct {
+    _0 World
+    _1 Unit
+}
+var _cnvIOHelper = func (_0 World) func (Unit) ADT {
+    return func (_1 Unit) ADT {
+    return ADT{_cniIOHelper,_cnsIOHelper{_0,_1}}}}
 
 var _cniCons = 0
 type _cnsCons struct {
@@ -144,18 +135,39 @@ func _fn0() func (ADT) ADT {
 
 var _show = _fn0()
 
-func _fn1() func (ADT) func (World) World {
-    _0 := func (_n ADT) func (World) World {
+func _fn1() func (int) func (World) ADT {
+    _0 := func (_c int) func (World) ADT {
+    _1 := func (_w World) ADT {
+    _2 := _w
+    _3 := _c
+    _4 := ___printChar
+    _5 := _4(_3)
+    _6 := _5(_2)
+    _7 := _w
+    _8 := _cnvIOHelper
+    _9 := _8(_7)
+    _10 := _9(_6)
+    return _10
+    }
+    return _1
+    }
+    return _0;
+}
+
+var _printChar = _fn1()
+
+func _fn2() func (ADT) func (World) ADT {
+    _0 := func (_n ADT) func (World) ADT {
     _1 := _n
     
     _2 := _1.t
-    var _3 func (World) World
+    var _3 func (World) ADT
     switch (_2) {
     case _cniNil:
     
     
     _4 := 10
-    _5 := ___printChar
+    _5 := _printChar
     _6 := _5(_4)
     _3 = _6
     case _cniCons:
@@ -167,25 +179,28 @@ func _fn1() func (ADT) func (World) World {
     _8 := _1.v.(_cnsCons)._1
     _l := _8
     
-    _9 := _l
-    _10 := _fn1()
-    _11 := _10(_9)
-    _12 := _i
-    _13 := ___printChar
-    _14 := _13(_12)
-    _15 := _bind
-    _16 := _15(_14)
-    _17 := _16(_11)
-    _3 = _17
+    _9 := func (_x Unit) func (World) ADT {
+    _10 := _l
+    _11 := _fn2()
+    _12 := _11(_10)
+    return _12
+    }
+    _13 := _i
+    _14 := _printChar
+    _15 := _14(_13)
+    _16 := _bind
+    _17 := _16(_15)
+    _18 := _17(_9)
+    _3 = _18
     }
     return _3
     }
     return _0;
 }
 
-var _print = _fn1()
+var _print = _fn2()
 
-func _fn2() func (World) World {
+func _fn3() func (World) ADT {
     _0 := _cnvTrue
     _1 := _show
     _2 := _1(_0)
@@ -194,17 +209,35 @@ func _fn2() func (World) World {
     return _4;
 }
 
-var __lmmain = _fn2()
+var __lmmain = _fn3()
 
-func _fn3() func (func (World) World) func (func (World) World) func (World) World {
-    _0 := func (_a func (World) World) func (func (World) World) func (World) World {
-    _1 := func (_b func (World) World) func (World) World {
-    _2 := func (_x World) World {
-    _3 := _x
+func _fn4() func (func (World) ADT) func (func (Unit) func (World) ADT) func (World) ADT {
+    _0 := func (_a func (World) ADT) func (func (Unit) func (World) ADT) func (World) ADT {
+    _1 := func (_f func (Unit) func (World) ADT) func (World) ADT {
+    _2 := func (_w World) ADT {
+    _3 := _w
     _4 := _a
     _5 := _4(_3)
-    _6 := _b
-    _7 := _6(_5)
+    
+    _6 := _5.t
+    var _7 ADT
+    switch (_6) {
+    case _cniIOHelper:
+    
+    
+    _8 := _5.v.(_cnsIOHelper)._0
+    _w2 := _8
+    
+    _9 := _5.v.(_cnsIOHelper)._1
+    _g := _9
+    
+    _10 := _w2
+    _11 := _g
+    _12 := _f
+    _13 := _12(_11)
+    _14 := _13(_10)
+    _7 = _14
+    }
     return _7
     }
     return _2
@@ -214,4 +247,4 @@ func _fn3() func (func (World) World) func (func (World) World) func (World) Wor
     return _0;
 }
 
-var _bind = _fn3()
+var _bind = _fn4()

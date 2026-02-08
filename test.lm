@@ -77,6 +77,10 @@ data Bool
 
 data List a = Cons a (List a) | Nil
 
+data IOHelper a = IOHelper World a
+
+type IO a = World -> IOHelper a
+
 type String = List Char
 
 class Show a where
@@ -87,14 +91,38 @@ instance Show Bool where
         True -> Cons 'T' (Cons 'r' (Cons 'u' (Cons 'e' Nil)))
         False -> Cons 'F' (Cons 'a' (Cons 'l' (Cons 's' (Cons 'e' Nil))))
 
-bind a b = \x -> b (a x)
+-- primIO :: a -> IO a
+-- primIO a = \w -> IOHelper w a
 
-print :: List Char -> IO
+__printChar :: Char -> World -> Unit
+
+printChar :: Char -> IO Unit
+printChar c = \w -> IOHelper w (__printChar c w)
+
+bind :: IO a -> (a -> IO b) -> IO b
+-- bind :: (World -> IOHelper a) -> (a -> (World -> IOHelper b)) -> (World -> IOHelper b)
+bind a f = \w -> case a w of
+    IOHelper w2 g -> f g w2
+-- bind a b = \x -> b (a x)
+
+print :: List Char -> IO Unit
 print n = case n of
-    Cons i l -> bind (__printChar i) (print l)
-    Nil -> __printChar '\n'
+    Cons i l -> bind (printChar i) (\x -> (print l))
+    Nil -> printChar '\n'
 
 main = print (show True)
+
+-- main :: IO Unit
+
+-- pt = __printChar 't'
+-- pr :: Unit -> IO Unit
+-- pr a = __printChar 'r'
+--
+-- ba = bind pt
+-- bb = ba pr
+
+-- main = bb
+-- main = bind (printChar 't') (\x -> printChar 'r')
 
 -- class Eq a where
 --     eq :: a -> a -> Bool
@@ -113,6 +141,7 @@ main = print (show True)
 
 -- main :: Int
 
+-- main = 1 + 2
 -- main = eq False True
 -- main = const 1 2
 -- main = True 4
