@@ -94,23 +94,25 @@ instance Show Bool where
 primIO :: a -> IO a
 primIO a = \w -> IOHelper w a
 
-__printChar :: Char -> Unit
+pure = primIO
 
-printChar :: Char -> IO Unit
-printChar c = primIO (__printChar c)
-
-bind :: IO a -> (a -> IO b) -> IO b
+-- __printChar :: Char -> Unit
+--
+-- printChar :: Char -> IO Unit
+-- printChar c = primIO (__printChar c)
+--
+-- bind :: IO a -> (a -> IO b) -> IO b
 -- bind :: (World -> IOHelper a) -> (a -> (World -> IOHelper b)) -> (World -> IOHelper b)
-bind a f = \w -> case a w of
-    IOHelper w2 g -> f g w2
+-- bind a f = \w -> case a w of
+--     IOHelper w2 g -> f g w2
 -- bind a b = \x -> b (a x)
 
-print :: List Char -> IO Unit
-print n = case n of
-    Cons i l -> bind (printChar i) (\x -> (print l))
-    Nil -> printChar '\n'
-
-main = print (show True)
+-- print :: List Char -> IO Unit
+-- print n = case n of
+--     Cons i l -> bind (printChar i) (\x -> (print l))
+--     Nil -> printChar '\n'
+--
+-- main = print (show True)
 
 -- main :: IO Unit
 
@@ -120,6 +122,8 @@ main = print (show True)
 --
 -- ba = bind pt
 -- bb = ba pr
+
+main = pure "test"
 
 -- main = bb
 -- main = bind (printChar 't') (\x -> printChar 'r')

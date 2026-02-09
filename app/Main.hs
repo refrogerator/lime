@@ -802,6 +802,7 @@ typecheck env n@(LimeNode node npos _) = case node of
         pure $ (Map.union s1 s2, n { expr = Let (l { info = info r' }) r' e', info = info e' })
     Int _ -> pure $ (Map.empty, n { info = defInt })
     Char _ -> pure $ (Map.empty, n { info = defChar })
+    String _ -> pure $ (Map.empty, n { info = defString })
 
     -- catch all so the darn language server doesn't complain
     _ -> throwError (npos, TEUnsupportedExpr n)
@@ -1032,6 +1033,9 @@ defChar = TNamed "Char" [] $ TPrim $ PInt 1 True
 defFloat :: LimeType
 defFloat = TNamed "Float" [] $ TPrim $ PFloat 4
 
+defString :: LimeType
+defString = TNamed "String" [] $ TPrim $ PString
+
 defUnit :: LimeType
 defUnit = TPrim $ PUnit
 
@@ -1052,10 +1056,9 @@ defaultTypes =
     [ ("Int", Forall [] defInt),
       ("Char", Forall [] defChar),
       ("Float", Forall [] defFloat),
+      ("String", Forall [] defString),
       ("Unit", Forall [] defUnit),
       ("World", Forall [] defWorld)
-      -- ("IOHelper", Forall [(0, Set.empty)] $ defIOHelper $ defTV 0),
-      -- ("IO", Forall [(0, Set.empty)] $ defIO $ defTV 0)
     ]
 
 builtinFunctions :: Map Text Scheme
@@ -1064,11 +1067,6 @@ builtinFunctions = Map.fromList
       ("__sub", Forall [] $ infixType defInt),
       ("__mul", Forall [] $ infixType defInt),
       ("__div", Forall [] $ infixType defInt)
-      -- ("__printChar", Forall [] $ TLambda defChar $ defIO $ defUnit)
-        -- bind :: IO a -> (a -> IO b) -> IO b
-      -- ("IOHelper", Forall [(0, Set.empty)] $ TLambda defWorld $ TLambda (defTV 0) (defIOHelper $ defTV 0)),
-      -- ("bind", Forall [(0, Set.empty), (1, Set.empty)] $ TLambda (defIO $ defTV 0) $ TLambda (TLambda (defTV 0) (defIO $ defTV 1)) $ defIO $ defTV 1),
-      -- ("pure", Forall [(0, Set.empty)] $ TLambda (defTV 0) $ defIO $ defTV 0)
     ]
 
 defaultValues :: Map Text Scheme
@@ -1119,6 +1117,7 @@ printTypeGo = \case
     TPrim p -> case p of
         PFloat _ -> "float"
         PInt _ _ -> "int"
+        PString -> "string"
         PUnit -> "Unit"
         PWorld -> "World"
     TADT _ _ _ -> "ADT"
@@ -1133,6 +1132,7 @@ type Counter = State Int
 
 data Value
     = VInt Int
+    | VString Text
     | VArray LimeType [Value]
     | VFunc (Text, LimeType, LimeType) [Instruction]
     | VConstructorIndex Text
@@ -1206,6 +1206,7 @@ linearize n@(LimeNode node npos ninfo) = case node of
         pure $ [IBlock (info e) (r' <> [ISetVal a] <> e')]
     Int v -> pure [IConst $ VInt v]
     Char v -> pure [IConst $ VInt $ fromEnum v]
+    String v -> pure [IConst $ VString v]
     _ -> error $ T.unpack $ printNode n
 
     -- catch all so the darn language server doesn't complain
@@ -1254,6 +1255,7 @@ pushStack = do
 valueToGo :: Value -> GoBackend Text
 valueToGo v = case v of
     VInt i -> pure $ T.pack (show i)
+    VString i -> pure $ T.pack (show i)
     VArray t v -> do
         v' <- (T.intercalate ", " <$> (traverse valueToGo v))
         pure $ "[]" <> printTypeGo t <> "{" <> v'
@@ -1436,10 +1438,10 @@ monomorphizeFunCall n@(LimeNode node _ ninfo') env = let ninfo = apply env ninfo
         (f', n', ft, fnEnv) <- monomorphizeFunCall f env
         a' <- monomorphize env a
 
-        -- let f la lr = trace (show fnEnv') $ pure $ (n { expr = FunCall f' a' }, n', lr, fnEnv')
+        -- let f la lr = trace (show fnEnv') $ pure $ (n { expr = FunCall f' a', info = ninfo}, n', lr, fnEnv')
         let f la lr = pure $ (n { expr = FunCall f' a' }, n', lr, fnEnv')
                 where fnEnv' = Map.union (mUnify la (info a)) fnEnv
-                -- where fnEnv' = trace ((T.unpack $ printType la) <> " <-> " <> (T.unpack $ printType $ info a')) Map.union (mUnify la (info a)) fnEnv
+                -- where fnEnv' = trace ((T.unpack $ printType la) <> " <-> " <> (T.unpack $ printType $ info a') <> "\na' = " <> show env) Map.union (mUnify la (info a')) fnEnv
         case ft of
             TLambda la lr -> f la lr
             _ -> f ft ft
@@ -1488,7 +1490,7 @@ monomorphizePMCase env i n@(LimeNode node pos ninfo) = case node of
     _ -> pure ()
 
 monomorphize :: Map Int LimeType -> LimeNode -> Monomorphizer LimeNode
-monomorphize env n@(LimeNode node npos ninfo) = case node of
+monomorphize env n@(LimeNode node npos ninfo') = let ninfo = apply env ninfo' in case node of
     FunCall f a -> do
         (n', r, ta, fnEnv) <- monomorphizeFunCall n env
         -- TODO figure out whether this is even necessary
@@ -1497,7 +1499,7 @@ monomorphize env n@(LimeNode node npos ninfo) = case node of
         case r of
             Just r' -> case r' of
                 FTFn r'' -> monomorphizeFnTL r'' fnEnv'
-                FTCon c -> reqTypes %= Set.insert (c, apply env ninfo)
+                FTCon c -> reqTypes %= Set.insert (c, ninfo)
                 -- TODO monomorphize class instances
                 FTCFn name finfo -> do
                     -- impls <- trace (show name <> " " <> (T.unpack $ printType finfo)) $ gets _mImplementations
@@ -1507,7 +1509,7 @@ monomorphize env n@(LimeNode node npos ninfo) = case node of
                         Just f -> trace (T.unpack $ printType finfo) $ monomorphizedFns %= Map.insert (name, finfo) (n { expr = Infix AssignValue (LimeNode (Symbol name) npos finfo) f, info = finfo })
                         Nothing -> error "impossible"
             Nothing -> pure ()
-        pure $ n' { info = apply env ninfo }    
+        pure $ n' { info = ninfo }    
     Symbol s -> do
         v <- gets _mFunctions
         cur <- gets _curMFn
@@ -1516,14 +1518,16 @@ monomorphize env n@(LimeNode node npos ninfo) = case node of
         else
             case v !? s of
                 Just mf -> case mf of
-                    FTFn r'' -> monomorphizeFnTL r'' Map.empty
-                    FTCon c -> reqTypes %= Set.insert (c, apply env ninfo)
+                    FTFn r'' -> do
+                        let fnEnv = mUnify ninfo (info r'')
+                        monomorphizeFnTL r'' fnEnv
+                    FTCon c -> reqTypes %= Set.insert (c, ninfo)
                 Nothing -> pure ()
-        pure $ n { info = apply env ninfo }
+        pure $ n { info = ninfo }
     Lambda l r@(LimeNode _ _ rinfo) -> do
         r' <- monomorphize env r
         l' <- traverse (monomorphize env) l
-        pure $ n { expr = Lambda l' r', info = apply env ninfo }
+        pure $ n { expr = Lambda l' r', info = ninfo }
     Prefix op r -> do
         r' <- monomorphize env r
         pure n { expr = Prefix op r' }
@@ -1538,7 +1542,7 @@ monomorphize env n@(LimeNode node npos ninfo) = case node of
     Case v cs -> do
         v' <- monomorphize env v
         cs' <- traverse (\(a, b) -> (a,) <$> (monomorphize env b) <* (monomorphizePMCase env 0 a)) cs
-        pure n { expr = Case v' cs', info = apply env ninfo }
+        pure n { expr = Case v' cs', info = ninfo }
     Discard -> pure n
     Int _ -> pure n
     Char _ -> pure n
@@ -1597,6 +1601,7 @@ typecheckLime ns fileContents = let Identity (r, s) = runStateT (runExceptT $ ty
 printValue :: Int -> Value -> Text
 printValue i v = case v of
     VInt i -> "VInt " <> T.pack (show i)
+    VString i -> "VString " <> T.pack (show i)
     VArray _ a -> "Varray [" <> T.intercalate ", " (map (printValue 0) a) <> "]"
     VFunc (n,_,_) is -> "VFunc " <> n <> "\n" <> (T.intercalate "\n" $ map (printInstruction (i+4)) is)
     VConstructorIndex t -> "VConstructorIndex " <> t
