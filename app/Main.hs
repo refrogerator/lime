@@ -1344,11 +1344,12 @@ linearizedToGo = \case
 functionToGo :: Int -> [Instruction] -> LimeType -> Text -> Text
 functionToGo name is t tname = evalState f (GoBackendData [] 0 (Map.singleton tname name)) 
     where f = do
+            let comment = "// " <> tname <> " :: " <> printType t <> "\n"
             let header = "func _fn" <> T.pack (show name) <> "() " <> printTypeGo t <> " {\n    "
             v <- T.intercalate "\n    " <$> (traverse linearizedToGo is)
             r <- popStack
             _ <- (assert . null) <$> gets _stack
-            pure $ header <> v <> "\n    return " <> r <> ";\n}\n\n" <> nameDef
+            pure $ comment <> header <> v <> "\n    return " <> r <> ";\n}\n\n" <> nameDef
           nameDef = "var _" <> tname <> " = _fn" <> T.pack (show name) <> "()"
 
 goGenerateConstructor :: (Text, [LimeType]) -> Text

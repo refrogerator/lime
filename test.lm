@@ -77,34 +77,49 @@ data Bool
 
 data List a = Cons a (List a) | Nil
 
+-- class Show a where
+--     show :: a -> List Char
+--
+-- instance Show Bool where
+--     show a = case a of
+--         True -> Cons 'T' (Cons 'r' (Cons 'u' (Cons 'e' Nil)))
+--         False -> Cons 'F' (Cons 'a' (Cons 'l' (Cons 's' (Cons 'e' Nil))))
+
 data IOHelper a = IOHelper World a
 
 type IO a = World -> IOHelper a
 
-type String = List Char
-
-class Show a where
-    show :: a -> List Char
-
-instance Show Bool where
-    show a = case a of
-        True -> Cons 'T' (Cons 'r' (Cons 'u' (Cons 'e' Nil)))
-        False -> Cons 'F' (Cons 'a' (Cons 'l' (Cons 's' (Cons 'e' Nil))))
-
 primIO :: a -> IO a
 primIO a = \w -> IOHelper w a
 
-pure = primIO
+bind :: IO a -> (a -> IO b) -> IO b
+bind a f = \w -> case a w of
+    IOHelper w2 g -> f g w2
 
--- __printChar :: Char -> Unit
+-- class Monad m where
+--     bind :: m a -> (a -> m b) -> m b
+--     return :: a -> m a
+
+-- instance Monad IO where
+--     bind = ioBind
+--     return = primIO
+
+__printChar :: Char -> Unit
+
+printChar :: Char -> IO Unit
+printChar c = primIO (__printChar c)
+
+__printString :: String -> Unit
+
+putStr :: String -> IO Unit
+putStr s = primIO (__printString s)
+
+putStrLn :: String -> IO Unit
+putStrLn s = bind (putStr s) (\a -> printChar '\n')
+
+main = putStrLn "test"
+
 --
--- printChar :: Char -> IO Unit
--- printChar c = primIO (__printChar c)
---
--- bind :: IO a -> (a -> IO b) -> IO b
--- bind :: (World -> IOHelper a) -> (a -> (World -> IOHelper b)) -> (World -> IOHelper b)
--- bind a f = \w -> case a w of
---     IOHelper w2 g -> f g w2
 -- bind a b = \x -> b (a x)
 
 -- print :: List Char -> IO Unit
@@ -122,8 +137,6 @@ pure = primIO
 --
 -- ba = bind pt
 -- bb = ba pr
-
-main = pure "test"
 
 -- main = bb
 -- main = bind (printChar 't') (\x -> printChar 'r')
