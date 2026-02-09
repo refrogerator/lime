@@ -1476,7 +1476,8 @@ monomorphizePMCase env i n@(LimeNode node pos ninfo) = case node of
     Symbol s -> do
         v <- gets _mFunctions
         case v !? s of
-            Just mf -> trace (T.unpack s <> show mf) $ case mf of
+            -- Just mf -> trace (T.unpack s <> show (apply env ninfo)) $ case mf of
+            Just mf -> case mf of
                 FTCon c -> reqTypes %= Set.insert (c, getRet i $ apply env ninfo)
                     where getRet i t = if i > 0 then case t of
                             TLambda _ r -> getRet (i-1) r
@@ -1496,7 +1497,7 @@ monomorphize env n@(LimeNode node npos ninfo) = case node of
         case r of
             Just r' -> case r' of
                 FTFn r'' -> monomorphizeFnTL r'' fnEnv'
-                FTCon c -> reqTypes %= Set.insert (c, ninfo)
+                FTCon c -> reqTypes %= Set.insert (c, apply env ninfo)
                 -- TODO monomorphize class instances
                 FTCFn name finfo -> do
                     -- impls <- trace (show name <> " " <> (T.unpack $ printType finfo)) $ gets _mImplementations

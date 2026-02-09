@@ -42,9 +42,7 @@ func ___div(a int) func (int) int {
 type World struct {}
 type Unit struct {}
 
-func ___printChar(c int) func (World) Unit {
-	return func (_ World) Unit {
-		fmt.Printf("%c", c)
-		return Unit{}
-	}
+func ___printChar(c int) Unit {
+	fmt.Printf("%c", c)
+	return Unit{}
 }

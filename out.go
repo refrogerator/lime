@@ -42,11 +42,9 @@ func ___div(a int) func (int) int {
 type World struct {}
 type Unit struct {}
 
-func ___printChar(c int) func (World) Unit {
-	return func (_ World) Unit {
-		fmt.Printf("%c", c)
-		return Unit{}
-	}
+func ___printChar(c int) Unit {
+	fmt.Printf("%c", c)
+	return Unit{}
 }
 
 var _cniTrue = 0
@@ -137,19 +135,12 @@ var _show = _fn0()
 
 func _fn1() func (int) func (World) ADT {
     _0 := func (_c int) func (World) ADT {
-    _1 := func (_w World) ADT {
-    _2 := _w
-    _3 := _c
-    _4 := ___printChar
+    _1 := _c
+    _2 := ___printChar
+    _3 := _2(_1)
+    _4 := _primIO
     _5 := _4(_3)
-    _6 := _5(_2)
-    _7 := _w
-    _8 := _cnvIOHelper
-    _9 := _8(_7)
-    _10 := _9(_6)
-    return _10
-    }
-    return _1
+    return _5
     }
     return _0;
 }
@@ -200,7 +191,24 @@ func _fn2() func (ADT) func (World) ADT {
 
 var _print = _fn2()
 
-func _fn3() func (World) ADT {
+func _fn3() func (Unit) func (World) ADT {
+    _0 := func (_a Unit) func (World) ADT {
+    _1 := func (_w World) ADT {
+    _2 := _a
+    _3 := _w
+    _4 := _cnvIOHelper
+    _5 := _4(_3)
+    _6 := _5(_2)
+    return _6
+    }
+    return _1
+    }
+    return _0;
+}
+
+var _primIO = _fn3()
+
+func _fn4() func (World) ADT {
     _0 := _cnvTrue
     _1 := _show
     _2 := _1(_0)
@@ -209,9 +217,9 @@ func _fn3() func (World) ADT {
     return _4;
 }
 
-var __lmmain = _fn3()
+var __lmmain = _fn4()
 
-func _fn4() func (func (World) ADT) func (func (Unit) func (World) ADT) func (World) ADT {
+func _fn5() func (func (World) ADT) func (func (Unit) func (World) ADT) func (World) ADT {
     _0 := func (_a func (World) ADT) func (func (Unit) func (World) ADT) func (World) ADT {
     _1 := func (_f func (Unit) func (World) ADT) func (World) ADT {
     _2 := func (_w World) ADT {
@@ -247,4 +255,4 @@ func _fn4() func (func (World) ADT) func (func (Unit) func (World) ADT) func (Wo
     return _0;
 }
 
-var _bind = _fn4()
+var _bind = _fn5()
