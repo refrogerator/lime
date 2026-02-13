@@ -9,7 +9,7 @@ type ADT struct {
 }
 
 func main() {
-	__lmmain(World{})
+	__lmmain.v.(_cnsIO)._0(World{})
 	var stats runtime.MemStats 
 	runtime.ReadMemStats(&stats)
 	fmt.Println(stats.Mallocs)

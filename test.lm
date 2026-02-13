@@ -87,14 +87,16 @@ data List a = Cons a (List a) | Nil
 
 data IOHelper a = IOHelper World a
 
-type IO a = World -> IOHelper a
+data IO a = IO (World -> IOHelper a)
 
 primIO :: a -> IO a
-primIO a = \w -> IOHelper w a
+primIO a = IO (\w -> IOHelper w a)
 
 bind :: IO a -> (a -> IO b) -> IO b
-bind a f = \w -> case a w of
-    IOHelper w2 g -> f g w2
+bind a f = IO \w -> case a of
+    IO a_ -> case a_ w of
+        IOHelper w2 g -> case f g of
+            IO b_ -> b_ w2
 
 -- class Monad m where
 --     bind :: m a -> (a -> m b) -> m b
